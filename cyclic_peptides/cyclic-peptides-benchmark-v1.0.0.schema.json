@@ -82,7 +82,7 @@
               "enum": [
                 "RHOMBIC_DODECAHEDRON",
                 "CUBE",
-                "RHOMBIC_DODECAHEDRON_XYSQUARE"
+                "RHOMBIC_DODECAHEDRON_XYHEX"
               ],
               "description": "Shape of the periodic box"
             }
@@ -201,42 +201,27 @@
         },
         "file_names": {
           "type": "object",
-          "description": "Python f-string templates for output file paths. Available variables: {smiles}, {sequence}, {name} (from target); {n_replicas} (from ensemble); {timestep} (from integration).",
+          "description": "Python f-string templates for output file paths. Available variables: {smiles}, {sequence}, {name}, {n_replicas}, {timestep_fs}.",
           "additionalProperties": false,
           "properties": {
-            "interchanges_file": {
-              "type": "string",
-              "default": "cyclic-{sequence}-{n_replicas}reps-interchanges.json",
-              "description": "Path for the serialized Interchange list (caches solvated+parametrized systems)"
-            },
-            "system_xml_file": {
-              "type": "string",
-              "default": "cyclic-{sequence}-system.xml",
-              "description": "Path for the serialized OpenMM system XML"
-            },
-            "pdb_file": {
-              "type": "string",
-              "default": "cyclic-{sequence}.pdb",
-              "description": "Path for the initial coordinates PDB file"
-            },
             "storage_file": {
               "type": "string",
-              "default": "cyclic_peptide.nc",
+              "default": "{name}-storage.nc",
               "description": "Path for the NetCDF trajectory/state reporter storage file"
             },
             "checkpoint_file": {
               "type": "string",
-              "default": "checkpoint.nc",
+              "default": "{name}-checkpoint.nc",
               "description": "Path for the simulation checkpoint file"
             },
             "save_state_prefix": {
               "type": "string",
-              "default": "state_",
+              "default": "{name}-state_",
               "description": "Prefix for full state save files"
             },
             "visualization_file": {
               "type": "string",
-              "default": "peptide.svg",
+              "default": "peptide_{name}.svg",
               "description": "Path for the peptide structure visualization SVG"
             }
           }
