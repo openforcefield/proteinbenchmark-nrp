@@ -1,4 +1,5 @@
 #! /usr/bin/env python3
+import bisect
 import curses
 import os
 import logging
@@ -87,6 +88,24 @@ _SPARK_HELP = [
      "Faster decorrelation in REST2 vs plain MD indicates the enhanced sampling is working. "
      "Yellow reference line: estimated plateau value (mean of the highest-lag half) — "
      "converges toward the true ensemble structural variance as more frames accumulate."),
+    # 7 — centroid RMSD
+    ("Kabsch RMSD (\u00c5) of each state-0 frame to the centroid (mean structure) of "
+     "the entire trajectory. All frames are first superposed onto frame 0; the "
+     "centroid is then the coordinate-wise mean of the aligned ensemble. "
+     "Frames far from the centroid represent structural outliers; "
+     "a flat, low plateau indicates tight conformational clustering around a "
+     "single dominant structure, while large excursions suggest significant "
+     "conformational heterogeneity. "
+     "Yellow reference line: mean centroid RMSD across all frames."),
+    # 8 — medoid RMSD
+    ("Kabsch RMSD (\u00c5) of each state-0 frame to the medoid — the single observed "
+     "frame that minimises the sum of pairwise RMSDs to all other frames. "
+     "Unlike the coordinate-wise mean (which may be unphysical when multiple "
+     "conformational states are visited), the medoid is always a real trajectory "
+     "frame. Frames in the same conformational cluster as the medoid appear near "
+     "zero; frames in a different cluster stand out as high-RMSD outliers, making "
+     "this a sensitive indicator of multi-state behaviour. "
+     "Yellow reference line: mean medoid RMSD across all frames."),
 ]
 
 _BAR_CHARS = " ▁▂▃▄▅▆▇█"  # index by round(fraction * 6); max displayed is ▆ (index 6)
@@ -220,6 +239,12 @@ def _addstr(stdscr: curses.window, text: str, attr: int = 0) -> None:
 # Braille dot bit values indexed by [sub_col][sub_row].
 # sub_col: 0 = left half of cell, 1 = right half.
 # sub_row: 0 = top, 3 = bottom (within the cell's 4-row band).
+# Sparkline rendering: if the mean number of data points per non-empty bin
+# exceeds this threshold the whole sparkline switches to mean+range marks;
+# below it every data point is plotted as an individual green dot.  Applied
+# globally so all columns use the same representation.
+_SPARK_DOTS_THRESHOLD = 3
+
 # Unicode braille block starts at U+2800; add bit pattern to get character.
 _BRAILLE_BITS: list[list[int]] = [
     [0x01, 0x02, 0x04, 0x40],  # left column
@@ -238,6 +263,7 @@ def _build_sparkline_grid(
     cp_ref: int = 0,
     ref_val: float | None = None,
     x_transform: Callable[[int], float] | None = None,
+    individual_dots: bool = False,
 ) -> tuple[list[list[tuple[str, int]]], float, float]:
     """Build a 2-D sparkline grid.
 
@@ -259,16 +285,25 @@ def _build_sparkline_grid(
     if not ground_u_history:
         return grid, 0.0, 1.0
 
-    # Pre-compute x-coordinates in display space (float, same scale as x_total)
-    if x_transform is not None:
-        x_positions = [x_transform(it) for it in ground_u_iters]
-        x_total     = x_transform(total_iters) * 1.05
+    # Pre-compute numpy arrays.  History is accumulated in replica order within
+    # each chunk, so x values may be out of chronological order.  Sort both
+    # arrays together so np.searchsorted produces correct bin assignments.
+    hist_arr = np.asarray(ground_u_history)
+    if x_transform is math.log10:
+        x_arr   = np.log10(np.asarray(ground_u_iters, dtype=float))
+        x_total = float(np.log10(total_iters)) * 1.05
+    elif x_transform is not None:
+        x_arr   = np.asarray([x_transform(it) for it in ground_u_iters])
+        x_total = x_transform(total_iters) * 1.05
     else:
-        x_positions = [float(it) for it in ground_u_iters]
-        x_total     = float(total_iters)
+        x_arr   = np.asarray(ground_u_iters, dtype=float)
+        x_total = float(total_iters)
+    sort_idx = np.argsort(x_arr, kind="stable")
+    x_arr    = x_arr[sort_idx]
+    hist_arr = hist_arr[sort_idx]
 
-    y_min = min(ground_u_history)
-    y_max = max(ground_u_history)
+    y_min = float(hist_arr.min())
+    y_max = float(hist_arr.max())
     if ref_val is not None:
         y_min = min(y_min, ref_val)
         y_max = max(y_max, ref_val)
@@ -292,18 +327,29 @@ def _build_sparkline_grid(
             for c in range(width):
                 grid[ref_r][c] = ("─", cp_ref)
 
+        bin_edges  = np.linspace(0.0, x_total, width + 1)
+        lo_indices = np.searchsorted(x_arr, bin_edges[:-1], side="left")
+        hi_indices = np.searchsorted(x_arr, bin_edges[1:],  side="left")
+        bin_counts = hi_indices - lo_indices
+        n_nonempty = int(np.count_nonzero(bin_counts))
+        mean_count = float(bin_counts.sum()) / max(1, n_nonempty)
+        use_mean_range = not individual_dots and mean_count > _SPARK_DOTS_THRESHOLD
         for c in range(width):
-            lo_it = c / width * x_total
-            hi_it = (c + 1) / width * x_total
-            vals = [e for x, e in zip(x_positions, ground_u_history)
-                    if lo_it <= x < hi_it]
-            if not vals:
+            lo_idx = int(lo_indices[c])
+            hi_idx = int(hi_indices[c])
+            if lo_idx >= hi_idx:
                 continue
-            mean_r = _cell_row(float(np.mean(vals)))
-            top_r  = _cell_row(max(vals))
-            bot_r  = _cell_row(min(vals))
-            for r in range(top_r, bot_r + 1):
-                grid[r][c] = ("●" if r == mean_r else "│", cp_mean if r == mean_r else cp_range)
+            vals = hist_arr[lo_idx:hi_idx]  # O(1) view, no copy
+            if use_mean_range:
+                mean_r = _cell_row(float(vals.mean()))
+                top_r  = _cell_row(float(vals.max()))
+                bot_r  = _cell_row(float(vals.min()))
+                for r in range(top_r, bot_r + 1):
+                    grid[r][c] = ("●" if r == mean_r else "│", cp_mean if r == mean_r else cp_range)
+            else:
+                for v in vals:
+                    r = _cell_row(float(v))
+                    grid[r][c] = ("●", cp_mean)
 
         return grid, y_min, y_max
 
@@ -338,22 +384,34 @@ def _build_sparkline_grid(
         ref_ch  = ("─\u0305" if ref_dr % 4 == 0 else
                    "─\u0332" if ref_dr % 4 == 3 else "─")
 
-    # Data bars and mean dots
+    # All bin boundaries in one searchsorted call, then loop over non-empty bins.
+    bin_edges  = np.linspace(0.0, x_total, data_w + 1)
+    lo_indices = np.searchsorted(x_arr, bin_edges[:-1], side="left")
+    hi_indices = np.searchsorted(x_arr, bin_edges[1:],  side="left")
+    bin_counts = hi_indices - lo_indices
+    n_nonempty = int(np.count_nonzero(bin_counts))
+    mean_count = float(bin_counts.sum()) / max(1, n_nonempty)
+    use_mean_range = x_transform is None and mean_count > _SPARK_DOTS_THRESHOLD
+
     for dc in range(data_w):
-        lo_it = dc / data_w * x_total
-        hi_it = (dc + 1) / data_w * x_total
-        vals = [e for x, e in zip(x_positions, ground_u_history) if lo_it <= x < hi_it]
-        if not vals:
+        lo_idx = int(lo_indices[dc])
+        hi_idx = int(hi_indices[dc])
+        if lo_idx >= hi_idx:
             continue
-        mean_dr = _data_row(float(np.mean(vals)))
-        top_dr  = _data_row(max(vals))
-        bot_dr  = _data_row(min(vals))
-        # Only the topmost and bottommost range dots; mean dot in its own layer.
-        _dot(mean_bits, dc, mean_dr)
-        if top_dr != mean_dr:
-            _dot(range_bits, dc, top_dr)
-        if bot_dr != mean_dr:
-            _dot(range_bits, dc, bot_dr)
+        vals = hist_arr[lo_idx:hi_idx]  # O(1) view, no copy
+        if use_mean_range:
+            mean_dr = _data_row(float(vals.mean()))
+            top_dr  = _data_row(float(vals.max()))
+            bot_dr  = _data_row(float(vals.min()))
+            # Only topmost and bottommost range dots; mean dot in its own layer.
+            _dot(mean_bits, dc, mean_dr)
+            if top_dr != mean_dr:
+                _dot(range_bits, dc, top_dr)
+            if bot_dr != mean_dr:
+                _dot(range_bits, dc, bot_dr)
+        else:
+            for v in vals:
+                _dot(mean_bits, dc, _data_row(float(v)))
 
     # Compose: mean wins, then range; reference fills empty cells in its row.
     for r in range(height):
@@ -419,6 +477,96 @@ def _kabsch_rmsd(P: np.ndarray[Any, np.dtype[Any]], Q: np.ndarray[Any, np.dtype[
     d = np.linalg.det(Vt.T @ U.T)
     R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
     return float(np.sqrt(np.mean(np.sum((P_c @ R.T - Q_c) ** 2, axis=-1))))
+
+
+def _kabsch_align(
+    P: np.ndarray[Any, np.dtype[Any]],
+    Q: np.ndarray[Any, np.dtype[Any]],
+) -> np.ndarray[Any, np.dtype[Any]]:
+    """Return P centred and rotated to best superpose onto centred Q (both N×3 in nm)."""
+    P_c = P - P.mean(axis=0)
+    Q_c = Q - Q.mean(axis=0)
+    H = P_c.T @ Q_c
+    U, _, Vt = np.linalg.svd(H)
+    d = np.linalg.det(Vt.T @ U.T)
+    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    return np.array(P_c @ R.T)
+
+
+def _centroid_rmsd_vals(
+    frames: list[np.ndarray[Any, np.dtype[Any]]],
+) -> list[float]:
+    """Per-frame RMSD (Å) to the centroid (mean superposed structure).
+
+    All frames are first aligned to frame 0 via Kabsch superposition; the
+    centroid is then the coordinate-wise mean of the aligned ensemble.  One
+    Procrustes iteration is sufficient for monitoring purposes.
+    """
+    if not frames:
+        return []
+    ref = frames[0]
+    aligned: list[np.ndarray[Any, np.dtype[Any]]] = [
+        ref - ref.mean(axis=0)
+    ] + [_kabsch_align(f, ref) for f in frames[1:]]
+    centroid: np.ndarray[Any, np.dtype[Any]] = np.mean(aligned, axis=0)
+    return [
+        float(np.sqrt(np.mean(np.sum((a - centroid) ** 2, axis=-1)))) * 10.0
+        for a in aligned
+    ]
+
+
+def _centroid_rmsd_gen(S: types.SimpleNamespace) -> Generator[None, None, None]:
+    """Compute centroid RMSD incrementally, yielding after each Kabsch alignment.
+
+    Snapshots ``S.pos_all_frames`` at entry so mid-run frame additions do not
+    corrupt the ensemble.  Writes results to ``S.centroid_rmsd_cache`` and
+    ``S.centroid_n_frames_cached`` atomically at the end.  Clears
+    ``S.centroid_computing`` on exit (including on exception).
+    """
+    try:
+        frames = list(S.pos_all_frames)   # snapshot — immune to concurrent appends
+        n = len(frames)
+        if n == 0:
+            return
+        ref = frames[0]
+        aligned: list[np.ndarray[Any, np.dtype[Any]]] = [ref - ref.mean(axis=0)]
+        for f in frames[1:]:
+            aligned.append(_kabsch_align(f, ref))
+            yield
+        centroid: np.ndarray[Any, np.dtype[Any]] = np.mean(aligned, axis=0)
+        S.centroid_rmsd_cache = [
+            float(np.sqrt(np.mean(np.sum((a - centroid) ** 2, axis=-1)))) * 10.0
+            for a in aligned
+        ]
+        S.centroid_n_frames_cached = n
+    finally:
+        S.centroid_computing = False
+
+
+def _medoid_rmsd_gen(S: types.SimpleNamespace) -> Generator[None, None, None]:
+    """Compute medoid RMSD from the pairwise matrix without any additional Kabsch SVDs.
+
+    Snapshots ``S.pairwise_rmsd_mat`` at entry.  Builds the symmetric distance
+    matrix one row at a time (yielding after each row), finds the frame that
+    minimises the sum of pairwise distances (the medoid), then stores per-frame
+    RMSDs to the medoid in ``S.medoid_rmsd_cache``.  Clears ``S.medoid_computing``
+    on exit.
+    """
+    try:
+        mat_rows = [list(row) for row in S.pairwise_rmsd_mat]  # snapshot
+        n = len(mat_rows)
+        if n < 2:
+            return
+        mat = np.zeros((n, n))
+        for i, row in enumerate(mat_rows):
+            mat[i, :len(row)] = row
+            yield
+        mat = mat + mat.T
+        medoid_idx = int(np.argmin(mat.sum(axis=1)))
+        S.medoid_rmsd_cache = (mat[:, medoid_idx] * 10.0).tolist()
+        S.medoid_n_frames_cached = n
+    finally:
+        S.medoid_computing = False
 
 
 # ── Data-source abstraction ────────────────────────────────────────────────────
@@ -487,6 +635,11 @@ class SimulationReader(Protocol):
     @property
     def has_positions(self) -> bool:
         """Whether atomic positions are recorded (needed for RMSD modes)."""
+        ...
+
+    @property
+    def n_atoms(self) -> int:
+        """Number of atoms per replica in the positions array; 0 if unavailable."""
         ...
 
     # ── File management ────────────────────────────────────────────────────
@@ -647,6 +800,8 @@ class OpenmmToolsReader:
         self._has_t_kin     = has_ap and "velocities" in self._nc.variables
         self._has_volume    = "volumes"    in self._nc.variables
         self._has_positions = "positions"  in self._nc.variables
+        self._n_atoms       = (int(self._nc.variables["positions"].shape[2])  # type: ignore[union-attr]
+                               if self._has_positions else 0)
 
     # ── Static properties ──────────────────────────────────────────────────
 
@@ -672,6 +827,8 @@ class OpenmmToolsReader:
     def has_volume(self) -> bool:      return self._has_volume
     @property
     def has_positions(self) -> bool:   return self._has_positions
+    @property
+    def n_atoms(self) -> int:          return self._n_atoms
 
     # ── File management ────────────────────────────────────────────────────
 
@@ -830,6 +987,7 @@ def _init_state(
         has_t_kin=reader.has_t_kin,
         has_volume=reader.has_volume,
         pos_interval=reader.pos_interval,
+        n_atoms=reader.n_atoms,
         vel_interval=reader.vel_interval,
         # Accumulated exchange/energy state
         prev_iter=-2,
@@ -855,6 +1013,12 @@ def _init_state(
         pos_all_frames=[],
         pairwise_rmsd_mat=[],
         n_pos_frames=0,
+        centroid_rmsd_cache=[],       # per-frame centroid RMSD (Å); recomputed when frame count changes
+        centroid_n_frames_cached=0,   # len(pos_all_frames) when centroid_rmsd_cache was last computed
+        centroid_computing=False,     # True while _centroid_rmsd_gen task is in the runner
+        medoid_rmsd_cache=[],         # per-frame medoid RMSD (Å); recomputed when frame count changes
+        medoid_n_frames_cached=0,     # len(pairwise_rmsd_mat) when medoid_rmsd_cache was last computed
+        medoid_computing=False,       # True while _medoid_rmsd_gen task is in the runner
         pos_scan_iter=0,      # next iteration index to attempt for RMSD accumulation
         history_computing=False,  # True while _history_scan_gen task is in the runner
         rmsd_computing=False,     # True while _rmsd_gen task is in the runner
@@ -863,6 +1027,7 @@ def _init_state(
         show_spark_help=False,
         rmsd_input_active=False,
         rmsd_input_buf="",
+        rmsd_sel_error="",
         # Scrub state
         scrub_iter=None,          # None = live; int = pinned display iteration
         scrub_dirty=False,        # True when scrub_iter changed and data not yet read
@@ -936,18 +1101,28 @@ def _handle_key(key: int, S: types.SimpleNamespace) -> tuple[bool, bool]:
     if S.rmsd_input_active:
         if key in (ord("\n"), ord("\r"), curses.KEY_ENTER):
             try:
-                S.solute_atom_sel = _parse_atom_selection(S.rmsd_input_buf)
+                new_sel = _parse_atom_selection(S.rmsd_input_buf)
+                if S.n_atoms > 0 and max(new_sel) >= S.n_atoms:
+                    raise ValueError(f"atom index {max(new_sel)} out of range (max {S.n_atoms - 1})")
+                S.solute_atom_sel = new_sel
                 S.solute_sel_str = S.rmsd_input_buf
-                S.pos_frame_iters  = []
-                S.pos_all_frames   = []
-                S.pairwise_rmsd_mat = []
-                S.n_pos_frames     = 0
+                S.pos_frame_iters           = []
+                S.pos_all_frames            = []
+                S.pairwise_rmsd_mat         = []
+                S.n_pos_frames              = 0
+                S.centroid_rmsd_cache       = []
+                S.centroid_n_frames_cached  = 0
+                S.medoid_rmsd_cache         = []
+                S.medoid_n_frames_cached    = 0
                 S.pos_scan_iter    = 0
-                S.rmsd_computing   = False  # old task invalidated; runner drains naturally
-            except ValueError:
-                pass
-            S.rmsd_input_active = False
-            S.rmsd_input_buf = ""
+                S.rmsd_computing     = False  # old tasks invalidated; runner drains naturally
+                S.centroid_computing = False
+                S.medoid_computing   = False
+                S.rmsd_sel_error   = ""
+                S.rmsd_input_active = False
+                S.rmsd_input_buf = ""
+            except ValueError as exc:
+                S.rmsd_sel_error = str(exc)
             return True, False
         elif key == 27:  # Esc cancels
             S.rmsd_input_active = False
@@ -964,17 +1139,18 @@ def _handle_key(key: int, S: types.SimpleNamespace) -> tuple[bool, bool]:
         if key == ord("q"):
             return False, True
         elif key == ord("s"):
-            S.sparkline_mode = (S.sparkline_mode + 1) % 7
+            S.sparkline_mode = (S.sparkline_mode + 1) % len(_SPARK_HELP)
             return True, False
         elif key == ord("S"):
-            S.sparkline_mode = (S.sparkline_mode - 1) % 7
+            S.sparkline_mode = (S.sparkline_mode - 1) % len(_SPARK_HELP)
             return True, False
         elif key == ord("?"):
             S.show_spark_help = not S.show_spark_help
             return True, False
-        elif key == ord("a") and S.sparkline_mode in (3, 4, 5, 6):
+        elif key == ord("a") and S.sparkline_mode in (3, 4, 5, 6, 7, 8):
             S.rmsd_input_active = True
             S.rmsd_input_buf = S.solute_sel_str
+            S.rmsd_sel_error = ""
             return True, False
         elif key == ord("j") and not S.waiting and S.replica_states is not None:
             S.scrub_input_active = True
@@ -1230,7 +1406,6 @@ def _rmsd_gen(
 
 def _fetch_scrub_data(reader: SimulationReader, S: types.SimpleNamespace) -> None:
     """Read/compute all per-iteration data for the pinned scrub position."""
-    import bisect
     si         = S.scrub_iter
     n_replicas = S.n_replicas
     n_states   = S.n_states
@@ -1486,8 +1661,8 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
     _term_rows, _term_cols = stdscr.getmaxyx()
     spark_w = max(10, _term_cols - matrix_w - len(sep) - 1)
 
-    _SPARK_NAMES = ["reduced U", "volume", "online ΔF", "RMSD", "min-RMSD", "max-RMSD", "RMSD ACF"]
-    _SPARK_UNITS = ["kJ/mol",   "nm³",    "kT",        "Å",    "Å",        "Å",         "Å"]
+    _SPARK_NAMES = ["reduced U", "volume", "online ΔF", "RMSD", "min-RMSD", "max-RMSD", "RMSD ACF", "centroid RMSD", "medoid RMSD"]
+    _SPARK_UNITS = ["kJ/mol",   "nm³",    "kT",        "Å",    "Å",        "Å",         "Å",        "Å",             "Å"]
 
     # Derive sparkline data from cached state based on current mode
     mode = S.sparkline_mode
@@ -1518,6 +1693,14 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
             sp_vals = [max(S.pairwise_rmsd_mat[i]) for i in range(1, S.n_pos_frames)]
         else:
             sp_iters, sp_vals = [], []
+    elif mode == 7:  # centroid RMSD — reads from cache filled by _centroid_rmsd_gen
+        n_cached = S.centroid_n_frames_cached
+        sp_iters = S.pos_frame_iters[:n_cached]
+        sp_vals  = S.centroid_rmsd_cache
+    elif mode == 8:  # medoid RMSD — reads from cache filled by _medoid_rmsd_gen
+        n_cached = S.medoid_n_frames_cached
+        sp_iters = S.pos_frame_iters[:n_cached]
+        sp_vals  = S.medoid_rmsd_cache
     else:  # mode == 6 — ACF (log x-axis for adaptive resolution)
         if S.n_pos_frames >= 2:
             max_lag = S.n_pos_frames // 2
@@ -1548,6 +1731,8 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
     elif mode == 6 and len(sp_vals) >= 4:
         half = len(sp_vals) // 2
         sp_ref_val = float(np.mean(sp_vals[half:]))
+    elif mode in (7, 8) and sp_vals:
+        sp_ref_val = float(np.mean(sp_vals))
     else:
         sp_ref_val = None
 
@@ -1576,8 +1761,10 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
 
     if mode == 6:
         xaxis_m = f"{S.n_pos_frames} frames" if S.n_pos_frames else ""
+    elif n_per_unit is not None and n_per_unit > _SPARK_DOTS_THRESHOLD:
+        xaxis_m = f"~{_fmt_2sf(n_per_unit)}/dot"
     else:
-        xaxis_m = f"~{_fmt_2sf(n_per_unit)}/dot" if n_per_unit is not None else ""
+        xaxis_m = ""
 
     spark_grid, spark_ymin, spark_ymax = _build_sparkline_grid(
         sp_iters, sp_vals,
@@ -1587,6 +1774,7 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
         cp_ref=curses.color_pair(_CP_DIM),
         ref_val=sp_ref_val,
         x_transform=math.log10 if mode == 6 else None,
+        individual_dots=mode == 6,
     )
 
     # Scrub cursor: blue vertical bar only on empty cells (never overwrites data)
@@ -1601,9 +1789,9 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
     sp_unit   = _SPARK_UNITS[mode]
     sp_prefix = f"State 0→{n_states-1} {sp_name}" if mode == 2 else f"State 0 {sp_name}"
 
-    if mode in (3, 4, 5, 6) and S.solute_atom_sel is None:
+    if mode in (3, 4, 5, 6, 7, 8) and S.solute_atom_sel is None:
         spark_title = f"{sp_prefix}  (press 'a' to set atom selection)"
-    elif mode in (3, 4, 5, 6):
+    elif mode in (3, 4, 5, 6, 7, 8):
         n_frames_total = display_iter // S.pos_interval + 1
         if S.n_pos_frames < n_frames_total:
             pct = S.n_pos_frames / n_frames_total * 100
@@ -1663,6 +1851,8 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
 
     if S.show_spark_help:
         help_text = _SPARK_HELP[mode]
+        if n_per_unit is not None and n_per_unit > _SPARK_DOTS_THRESHOLD:
+            help_text += " Green dots are means; white dots are min/max range."
         indent = " " * (matrix_w + len(sep))
         wrap_width = len(indent) + max(20, spark_w)
         wrapped = textwrap.fill(
@@ -1770,13 +1960,22 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
 
     # Bottom key-binding bar (nano-style, always at last row)
     _term_rows, _term_cols = stdscr.getmaxyx()
+    _prefix = _input_str = _hints = _err_str = ""  # set in rmsd_input_active branch
     if S.scrub_input_active:
         bar = f"  Jump to iteration: {S.scrub_input_buf}\u2588   (negative = from end)   Enter confirm   Esc cancel"
     elif S.rmsd_input_active:
-        bar = f"  Atom selection: {S.rmsd_input_buf}\u2588   e.g. 0-64,67,200-300   Enter confirm   Esc cancel"
+        _hints     = "   Enter confirm   Esc cancel"
+        _prefix    = "  Atom selection: "
+        _input_str = S.rmsd_input_buf + "\u2588"
+        _err_str   = f"  ✗ {S.rmsd_sel_error}" if S.rmsd_sel_error else ""
+        _lhs       = _prefix + _input_str
+        _mid       = ("  e.g. 0-64,67,200-300" if not S.rmsd_sel_error else "")
+        _rhs       = _mid + _err_str + _hints
+        gap        = max(1, _term_cols - 1 - len(_lhs) - len(_rhs))
+        bar        = _lhs + " " * gap + _rhs
     else:
         _z_label = "z Live" if _scrubbing else "z Freeze"
-        if mode in (3, 4, 5, 6):
+        if mode in (3, 4, 5, 6, 7, 8):
             sel_hint = f" ({S.solute_sel_str})" if S.solute_sel_str else ""
             bar = f"  q Quit   s/S Sparkline   ? Explain   a Atoms{sel_hint}   w/e ±1   W/E ±5%   j Jump   {_z_label}"
         else:
@@ -1787,6 +1986,19 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
         stdscr.addstr(bar, curses.A_REVERSE)
     except curses.error:
         pass
+    if S.rmsd_input_active and S.rmsd_sel_error:
+        _err_attr = curses.color_pair(_CP_RED) | curses.A_BOLD | curses.A_REVERSE
+        try:
+            # Redraw the input text in red+bold
+            stdscr.move(_term_rows - 1, len(_prefix))
+            stdscr.addstr(_input_str[:max(0, _term_cols - 1 - len(_prefix))], _err_attr)
+            # Redraw the error string in red+bold (sits just before the key hints)
+            _err_col = len(bar) - len(_hints) - len(_err_str)
+            if 0 <= _err_col < _term_cols - 1:
+                stdscr.move(_term_rows - 1, _err_col)
+                stdscr.addstr(_err_str[:max(0, _term_cols - 1 - _err_col)], _err_attr)
+        except curses.error:
+            pass
 
     stdscr.refresh()
 
@@ -1925,6 +2137,22 @@ def _main(
         ):
             S.rmsd_computing = True
             runner.submit(_rmsd_gen(reader, S))
+
+        if (
+            not S.centroid_computing
+            and S.pos_all_frames
+            and len(S.pos_all_frames) != S.centroid_n_frames_cached
+        ):
+            S.centroid_computing = True
+            runner.submit(_centroid_rmsd_gen(S))
+
+        if (
+            not S.medoid_computing
+            and S.n_pos_frames >= 2
+            and S.n_pos_frames != S.medoid_n_frames_cached
+        ):
+            S.medoid_computing = True
+            runner.submit(_medoid_rmsd_gen(S))
 
         # ── Run tasks for the rest of the 50 ms budget ─────────────────────
         # round-robin across tasks; each next() = one atomic work unit.
