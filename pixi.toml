@@ -16,6 +16,7 @@ openff-units = "*"
 openmm = ">=8.5.0"
 openmmforcefields = ">=0.12.0"
 openmmtools = ">=0.26.0"
+cyclopts = "*"
 
 [pypi-dependencies]
 proteinbenchmark = { git = "https://www.github.com/openforcefield/proteinbenchmark", rev = "cyclic-peptides" }
@@ -51,14 +52,10 @@ ruamel = "*"
 [feature.rocm.dependencies]
 pip = "*"
 [feature.rocm.activation]
-scripts = ["devtools/pixi-activation-scripts/rocm.sh"]
-
-[feature.monitor.dependencies]
-cyclopts = "*"
-
+scripts = ["pixi-activation-scripts/rocm.sh"]
 
 [environments]
-default = { features = ["analysis", "system-prep", "ruamel", "nagl", "monitor"], solve-group = "default" }
+default = { features = ["analysis", "system-prep", "ruamel", "nagl"], solve-group = "default" }
 rocm = { features = ["ruamel", "nagl", "rocm"], solve-group = "default" }
 espaloma = { features = ["analysis", "espaloma", "system-prep"], solve-group = "espaloma" }
 simulation = { features = [], solve-group = "default" }
