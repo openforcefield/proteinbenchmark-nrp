@@ -18,7 +18,9 @@ FF = "3.0.0a0-OPC3"
 TARGET_PATTERN = r"^.*/(.+)-storage.nc$"
 LOCAL_RESULT_DIR = Path("cyclic_peptides/results")
 N_REPLICATES = 3
-DOCKER_IMAGE = "ghcr.io/openforcefield/proteinbenchmark-nrp:cuda13.2-cyclicpeptides-rev0"
+DOCKER_IMAGE = (
+    "ghcr.io/openforcefield/proteinbenchmark-nrp:cuda13.2-cyclicpeptides-rev0"
+)
 
 
 def main():
@@ -42,12 +44,12 @@ def main():
                 / f"{target}-{FF}-{replica}.yaml"
             )
 
-            storage = Path(f"{LOCAL_RESULT_DIR}/{FF}/{target}/replica-{replica}/{src_storage.name}")
-            checkpoint = Path(f"{LOCAL_RESULT_DIR}/{FF}/{target}/replica-{replica}/{src_checkpoint.name}")
-            storage.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src_storage, storage)
-            checkpoint.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src_checkpoint, checkpoint)
+            storage = Path(f"{FF}/{target}/replica-{replica}/{src_storage.name}")
+            checkpoint = Path(f"{FF}/{target}/replica-{replica}/{src_checkpoint.name}")
+            (LOCAL_RESULT_DIR / storage).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(LOCAL_RESULT_DIR / src_storage, storage)
+            (LOCAL_RESULT_DIR / checkpoint).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(LOCAL_RESULT_DIR / src_checkpoint, checkpoint)
 
             manifest = add_env_to_template(
                 template,
@@ -58,6 +60,7 @@ def main():
                     "PROTBENCH_WINDOW": 0,
                     "PROTBENCH_SCRIPT_COMMIT": script_commit,
                     "PROTBENCH_SCRIPT_PATH": SCRIPT_PATH,
+                    "PROTBENCH_SCRIPT_ARG": f"--storage={storage}",
                     "PROTBENCH_REQUIRED_FILES": "\n".join(
                         [
                             str(storage),

@@ -119,7 +119,7 @@ spec:
             - -c
             - |
               micromamba run -n base pip install git+https://github.com/openforcefield/proteinbenchmark.git@cyclic-peptides
-              micromamba run -n base python /opt/repo/$(PROTBENCH_SCRIPT_PATH) -o/results
+              micromamba run -n base python /opt/repo/$(PROTBENCH_SCRIPT_PATH) $(PROTBENCH_SCRIPT_ARG)
               rclone copy --update /results nrp-internal:cyclicpeptides-am-bucket/results
           lifecycle:
             preStop:
