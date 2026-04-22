@@ -55,12 +55,7 @@
         "solvation": {
           "type": "object",
           "description": "Arguments to solvate_topology() from openff.interchange.components._packmol",
-          "required": [
-            "solvent_padding_nm",
-            "nacl_molarity",
-            "target_density",
-            "box_shape"
-          ],
+          "required": ["solvent_padding_nm", "nacl_molarity", "box_shape"],
           "additionalProperties": false,
           "properties": {
             "solvent_padding_nm": {
@@ -72,11 +67,6 @@
               "type": "number",
               "minimum": 0,
               "description": "NaCl concentration in mol/L (molar)"
-            },
-            "target_density": {
-              "type": "number",
-              "exclusiveMinimum": 0,
-              "description": "Target solvent density in g/mL"
             },
             "box_shape": {
               "enum": [
@@ -140,8 +130,7 @@
             "equilibration_length_ns",
             "traj_length_ns",
             "frame_length_ns",
-            "checkpoint_length_ns",
-            "save_state_length_ns"
+            "checkpoint_length_ns"
           ],
           "additionalProperties": false,
           "properties": {
@@ -164,11 +153,6 @@
               "type": "number",
               "exclusiveMinimum": 0,
               "description": "Interval between checkpoint saves in nanoseconds"
-            },
-            "save_state_length_ns": {
-              "type": "number",
-              "exclusiveMinimum": 0,
-              "description": "Interval between full state saves in nanoseconds"
             }
           }
         },

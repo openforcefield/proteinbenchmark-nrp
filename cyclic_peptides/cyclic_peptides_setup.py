@@ -3,12 +3,13 @@
 import json
 import logging
 from pathlib import Path
-from typing import Any, Literal, overload
+from typing import Any, Literal
 
+import cyclopts
 import numpy as np
 import openmm
+import openmm.app
 import openmmtools
-from cyclopts import App
 from openff.interchange import Interchange
 from openff.interchange.components._packmol import (
     RHOMBIC_DODECAHEDRON,
@@ -24,12 +25,6 @@ from proteinbenchmark import OpenMMHrexEnsemble, OpenMMSimulation
 from proteinbenchmark import read_xml as read_system_xml
 from proteinbenchmark import write_xml as write_system_xml
 
-app = App()
-logging.basicConfig(
-    level=logging.INFO,
-    datefmt="%Y-%m-%d %H:%M:%S",
-    format="%(asctime)s.%(msecs)03d [%(levelname)8s] %(message)s (%(filename)s:%(lineno)s via %(name)s)",
-)
 LOGGER = logging.getLogger(__name__)
 
 
@@ -47,9 +42,13 @@ BOX_SHAPES = {
 }
 
 
-@app.default
-def main(config_json: Path) -> None:
-    config = json.loads(config_json.read_bytes())
+def main(config_json: Path, debug: bool = False) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if debug else logging.INFO,
+        datefmt="%Y-%m-%d %H:%M:%S",
+        format="%(asctime)s.%(msecs)03d [%(levelname)8s] %(message)s (%(filename)s:%(lineno)s via %(name)s)",
+    )
+    config = load_config(config_json)
     n_replicas = config["configuration"]["ensemble"]["n_replicas"]
 
     for target_idx, target in enumerate(config["targets"]):
@@ -61,14 +60,23 @@ def main(config_json: Path) -> None:
                 target_idx,
             )
 
+        storage = ffn("storage_file")
+        checkpoint = ffn("checkpoint_file")
+        if storage.exists() and checkpoint.exists():
+            continue
+
+        LOGGER.info(f"Preparing target {target_idx}: {target['name']}...")
+        LOGGER.info("  Generating box...")
         interchange, positions, boxes = prep_target_modeller(
             n_replicas=n_replicas,
             **target,
-            **config["solvation"],
-            force_field=ForceField(config["configuration"]["force_field_files"]),
+            **config["configuration"]["solvation"],
+            force_field=ForceField(*config["configuration"]["force_field_files"]),
             vizualization_file=ffn("visualization_file"),
         )
         target_name = interchange.topology.molecule(0).properties["name"]
+
+        LOGGER.info("  Parametrizing and serializing System...")
 
         base_system = interchange.to_openmm_system(
             hydrogen_mass=config["configuration"]["integration"].get(
@@ -78,25 +86,28 @@ def main(config_json: Path) -> None:
         )
         base_system_xml_file = f"{target_name}-system.xml"
         write_system_xml(openmm_system=base_system, xml_file_name=base_system_xml_file)
-        for i,( this_positions, box) in enumerate(zip(positions, boxes)):
+        for i, (this_positions, box) in enumerate(zip(positions, boxes)):
             interchange.positions = this_positions
             interchange.box = box
             interchange.to_pdb(f"{target_name}-rung{i}.pdb")
 
-        storage = ffn("storage_file")
+        LOGGER.info("  Preparing OpenMMSimulation...")
+
         integration_config = config["configuration"]["integration"]
         lengths_config = config["configuration"]["lengths"]
+        ensemble_config = config["configuration"]["ensemble"]
         base_simulation = OpenMMSimulation(
             openmm_system_file=base_system_xml_file,
             initial_pdb_file=f"{target_name}-rung0.pdb",
             dcd_reporter_file=str(storage),
             state_reporter_file=str(storage),
-            checkpoint_file=str(ffn("checkpoint_file")),
+            checkpoint_file=str(checkpoint),
             save_state_prefix=str(ffn("save_state_prefix")),
             temperature=integration_config["temperature"] * openmm.unit.kelvin,
             pressure=integration_config["pressure"] * openmm.unit.atmosphere,
-            langevin_friction=integration_config["langevin_friction"]
-            / openmm.unit.picosecond,
+            langevin_friction=(
+                integration_config["langevin_friction"] / openmm.unit.picosecond
+            ),
             barostat_frequency=integration_config["barostat_frequency"],
             timestep=integration_config["timestep_fs"] * openmm.unit.femtosecond,
             traj_length=Quantity(
@@ -112,31 +123,40 @@ def main(config_json: Path) -> None:
                 "nanosecond",
             ).to_openmm(),
             save_state_length=Quantity(
-                lengths_config["save_state_length_ns"],
-                "nanosecond",
+                (
+                    ensemble_config[
+                        "steps_between_exchange_attempts"
+                    ]
+                    * integration_config["timestep_fs"]
+                ),
+                "femtosecond",
             ).to_openmm(),
         )
+
+        LOGGER.info("  Scaling...")
 
         ensemble = OpenMMHrexEnsemble.construct_rest2(
             n_replicas=n_replicas,
             base_simulation=base_simulation,
             tempered_atom_idcs=list(range(interchange.topology.molecule(0).n_atoms)),
-            steps_between_exchange_attempts=config["configuration"]["ensemble"][
+            steps_between_exchange_attempts=ensemble_config[
                 "steps_between_exchange_attempts"
             ],
             max_effective_temperature=Quantity(
-                config["configuration"]["ensemble"]["max_effective_temperature"],
+                ensemble_config["max_effective_temperature"],
                 "Kelvin",
             ),
         )
 
+        LOGGER.info("  Checking...")
         test_ensemble(ensemble, interchange, positions)
 
+        LOGGER.info("  Preparing sampler...")
         sampler = ensemble.setup_simulation(
             require_gpu=False,
         )
 
-        LOGGER.info("  set states for sampler")
+        LOGGER.info("  set states for sampler...")
         sampler.sampler_states = [
             openmmtools.states.SamplerState(
                 positions=this_positions.to_openmm(),
@@ -144,6 +164,22 @@ def main(config_json: Path) -> None:
             )
             for this_positions, box in zip(positions, boxes)
         ]
+        LOGGER.info("  Energy minimize...")
+        sampler.minimize()
+        LOGGER.info("  Equilibrate...")
+        sampler.equilibrate(
+            int(
+                np.ceil(
+                    lengths_config["equilibration_length_ns"]
+                    * 1_000_000
+                    / integration_config["timestep_fs"]
+                    / ensemble_config[
+                        "steps_between_exchange_attempts"
+                    ],
+                ),
+            ),
+        )
+        LOGGER.info("  Done!")
 
 
 def prep_target_packmol(
@@ -159,7 +195,7 @@ def prep_target_packmol(
     force_field: ForceField,
     vizualization_file: Path,
 ) -> tuple[Interchange, list[Quantity]]:
-    peptide = Molecule.from_smiles(smiles)
+    peptide = Molecule.from_smiles(smiles, allow_undefined_stereo=True)
     peptide.properties["sequence"] = sequence
     peptide.properties["name"] = name
     peptide.perceive_residues()
@@ -304,13 +340,14 @@ def solvate_with_modeller(
     topology: Topology,
     *,
     box_vectors: Quantity | None = None,
-    box_shape: Literal["cube", "dodecahedron", None] = None,
+    box_shape: Literal["RHOMBIC_DODECAHEDRON", "CUBE", None],
     box_padding: Quantity | None = None,
     box_width: Quantity | None = None,
     box_n_solvent: int | None = None,
     salt_conc: Quantity = Quantity(0.0, "mole/liter"),
     neutralize: bool = True,
-) -> None:
+) -> Topology:
+    # TODO: Make this work when residues are defined
     if box_shape is not None and (
         box_padding is None and box_width is None and box_n_solvent is None
     ):
@@ -342,6 +379,16 @@ def solvate_with_modeller(
         box_width = None
         box_shape = None
 
+    # Remove residue info so that SMIRNOFFTemplateGenerator can operate on
+    # whole molecules - we'll add it back after
+    topology = Topology(topology)
+    original_residue_names = [
+        atom.metadata.pop("residue_name", None) for atom in topology.atoms
+    ]
+    original_residue_numbers = [
+        atom.metadata.pop("residue_number", None) for atom in topology.atoms
+    ]
+
     modeller = openmm.app.Modeller(
         topology.to_openmm(),
         topology.get_positions().to_openmm(),
@@ -349,33 +396,47 @@ def solvate_with_modeller(
     ommff = openmm.app.ForceField("amber/tip3p_standard.xml")
     smirnoff = SMIRNOFFTemplateGenerator(
         forcefield="openff-2.3.0.offxml",
-        molecules={mol for mol in topology.unique_molecules if mol != WATER},
+        molecules=[mol for mol in topology.unique_molecules if mol != WATER],
     )
     ommff.registerTemplateGenerator(smirnoff.generator)
     modeller.addSolvent(
         forcefield=ommff,
         model="tip3p",
         boxVectors=box_vectors.to_openmm() if box_vectors is not None else None,
-        box_shape=box_shape,
+        boxShape={"RHOMBIC_DODECAHEDRON": "dodecahedron", "CUBE": "cube", None: None}[
+            box_shape
+        ],
         padding=box_padding.to_openmm() if box_padding is not None else None,
-        numAdded=box_n_solvent.to_openmm() if box_n_solvent is not None else None,
+        numAdded=box_n_solvent,
         ionicStrength=salt_conc.to_openmm(),
         positiveIon="Na+",
         negativeIon="Cl-",
         neutralize=neutralize,
     )
     topology = Topology.from_openmm(
-        modeller.topoloy,
+        modeller.topology,
         unique_molecules={*topology.unique_molecules, WATER, SODIUM, CHLORIDE},
     )
-    topology.set_positions(modeller.positions)
+    positions = Quantity(modeller.positions.value_in_unit(openmm.unit.nanometer), "nm")
+    topology.set_positions(positions)
+
+    # Restore residue info
+    for atom, resname, resnum in zip(
+        topology.atoms,
+        original_residue_names,
+        original_residue_numbers,
+    ):
+        if resname is not None:
+            atom.metadata["residue_name"] = resname
+            atom.metadata["residue_number"] = resnum
+
     return topology
 
 
 def prep_target_modeller(
     *,
     n_replicas: int,
-    box_shape: Literal["dodecahedron", "cube"],
+    box_shape: Literal["RHOMBIC_DODECAHEDRON", "CUBE"],
     nacl_molarity: float,
     solvent_padding_nm: float,
     smiles: str,
@@ -384,10 +445,9 @@ def prep_target_modeller(
     force_field: ForceField,
     vizualization_file: Path,
 ) -> tuple[Interchange, list[Quantity], list[Quantity]]:
-    peptide = Molecule.from_smiles(smiles)
+    peptide = Molecule.from_smiles(smiles, allow_undefined_stereo=True)
     peptide.properties["sequence"] = sequence
     peptide.properties["name"] = name
-    peptide.perceive_residues()
     vizualization_file.write_text(
         peptide.visualize(backend="rdkit", show_all_hydrogens=False).data,
     )
@@ -411,8 +471,9 @@ def prep_target_modeller(
             n_sodium = sum(1 for mol in solvated_top.molecules if mol == SODIUM)
             n_chloride = sum(1 for mol in solvated_top.molecules if mol == CHLORIDE)
             pack_box_kwargs = dict(
-                box_n_solvent=[n_waters + n_sodium + n_chloride],
+                box_n_solvent=n_waters + n_sodium + n_chloride,
                 salt_conc=Quantity(nacl_molarity, "molar"),
+                box_shape=box_shape,
             )
             print(pack_box_kwargs)
         else:
@@ -425,6 +486,7 @@ def prep_target_modeller(
         positions.append(this_positions)
         boxes.append(solvated_top.box_vectors)
 
+    solvated_top.molecule(0).perceive_residues()
     base_interchange = Interchange.from_smirnoff(
         force_field=force_field,
         topology=solvated_top,
@@ -437,7 +499,7 @@ def format_filename(fn: str, config: dict[str, Any], target: int) -> Path:
     smiles = config["targets"][target]["smiles"]
     sequence = config["targets"][target]["sequence"]
     name = config["targets"][target]["sequence"]
-    n_replicas = config["configuration"]["integration"]["n_replicas"]
+    n_replicas = config["configuration"]["ensemble"]["n_replicas"]
     timestep_fs = config["configuration"]["integration"]["timestep_fs"]
     return Path(
         fn.replace("{smiles}", f"{smiles}")
@@ -459,7 +521,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "checkpoint_file": "{name}-checkpoint.nc",
         "save_state_prefix": "{name}-state_",
         "visualization_file": "peptide_{name}.svg",
-        **config["configuration"]["file_names"],
+        **config["configuration"].get("file_names", {}),
     }
     return config
 
@@ -574,8 +636,6 @@ def set_up_simulation(
         topology=interchange.to_openmm_topology(),
         system=system,
         integrator=integrator,
-        platform=openmm.Platform.getPlatformByName("HIP"),
-        platformProperties={"Precision": "mixed"},
     )
     simulation.context.setPositions(interchange.positions.to_openmm())
     simulation.context.setPeriodicBoxVectors(*interchange.box.to_openmm())
@@ -584,4 +644,4 @@ def set_up_simulation(
 
 
 if __name__ == "__main__":
-    app()
+    cyclopts.run(main)

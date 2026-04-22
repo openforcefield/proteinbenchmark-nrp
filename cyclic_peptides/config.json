@@ -4,70 +4,69 @@
     {
       "name": "Cyclo-(GNSRV)",
       "sequence": "GNSRV",
-      "smiles": "N1[CH2]C(=O)N[C@H](CC(=O)[NH2])C(=O)N[C@H](CO)C(=O)N[C@H](CCCNC(=[NH2+])[NH2])C(=O)N[C@H](C(C)C)C1(=O)"
+      "smiles": "N1[CH2]C(=O)N[C@@H](CC(=O)[NH2])C(=O)N[C@@H](CO)C(=O)N[C@@H](CCCNC(=[NH2+])[NH2])C(=O)N[C@@H](C(C)C)C1(=O)"
     },
     {
       "name": "Cyclo-(GFDNV)",
       "sequence": "GFDNV",
-      "smiles": "N1[CH2]C(=O)N[C@H](Cc2ccccc2)C(=O)N[C@H](CC(=O)[O-])C(=O)N[C@H](CC(=O)[NH2])C(=O)N[C@H](C(C)C)C1(=O)"
+      "smiles": "N1[CH2]C(=O)N[C@@H](Cc2ccccc2)C(=O)N[C@@H](CC(=O)[O-])C(=O)N[C@@H](CC(=O)[NH2])C(=O)N[C@@H](C(C)C)C1(=O)"
     },
     {
       "name": "Cyclo-(AVVas)",
       "sequence": "AVVas",
-      "smiles": "N1[C@H](C)C(=O)N[C@H](C(C)C)C(=O)N[C@H](C(C)C)C(=O)N[C@@H](C)C(=O)N[C@@H](CO)C1(=O)"
+      "smiles": "N1[C@@H](C)C(=O)N[C@@H](C(C)C)C(=O)N[C@@H](C(C)C)C(=O)N[C@H](C)C(=O)N[C@H](CO)C1(=O)"
     },
     {
       "name": "Cyclo-(vNFRG)",
       "sequence": "vNFRG",
-      "smiles": "N1[C@@H](C(C)C)C(=O)N[C@H](CC(=O)[NH2])C(=O)N[C@H](Cc2ccccc2)C(=O)N[C@H](CCCNC(=[NH2+])[NH2])C(=O)N[CH2]C1(=O)"
+      "smiles": "N1[C@H](C(C)C)C(=O)N[C@@H](CC(=O)[NH2])C(=O)N[C@@H](Cc2ccccc2)C(=O)N[C@@H](CCCNC(=[NH2+])[NH2])C(=O)N[CH2]C1(=O)"
     },
     {
       "name": "Cyclo-(vRVRV)",
       "sequence": "vRVRV",
-      "smiles": "N1[C@@H](C(C)C)C(=O)N[C@H](CCCNC(=[NH2+])[NH2])C(=O)N[C@H](C(C)C)C(=O)N[C@H](CCCNC(=[NH2+])[NH2])C(=O)N[C@H](C(C)C)C1(=O)"
+      "smiles": "N1[C@H](C(C)C)C(=O)N[C@@H](CCCNC(=[NH2+])[NH2])C(=O)N[C@@H](C(C)C)C(=O)N[C@@H](CCCNC(=[NH2+])[NH2])C(=O)N[C@@H](C(C)C)C1(=O)"
     },
     {
       "name": "Cyclo-(vSSAV)",
       "sequence": "vSSAV",
-      "smiles": "N1[C@@H](C(C)C)C(=O)N[C@H](CO)C(=O)N[C@H](CO)C(=O)N[C@H](C)C(=O)N[C@H](C(C)C)C1(=O)"
+      "smiles": "N1[C@H](C(C)C)C(=O)N[C@@H](CO)C(=O)N[C@@H](CO)C(=O)N[C@@H](C)C(=O)N[C@@H](C(C)C)C1(=O)"
     },
     {
       "name": "Cyclo-(VVGGVG)",
       "sequence": "VVGGVG",
-      "smiles": "N1[C@H](C(C)C)C(=O)N[C@H](C(C)C)C(=O)N[CH2]C(=O)N[CH2]C(=O)N[C@H](C(C)C)C(=O)N[CH2]C1(=O)"
+      "smiles": "N1[C@@H](C(C)C)C(=O)N[C@@H](C(C)C)C(=O)N[CH2]C(=O)N[CH2]C(=O)N[C@@H](C(C)C)C(=O)N[CH2]C1(=O)"
     },
     {
       "name": "Cyclo-(VVGVGG)",
       "sequence": "VVGVGG",
-      "smiles": "N1[C@H](C(C)C)C(=O)N[C@H](C(C)C)C(=O)N[CH2]C(=O)N[C@H](C(C)C)C(=O)N[CH2]C(=O)N[CH2]C1(=O)"
+      "smiles": "N1[C@@H](C(C)C)C(=O)N[C@@H](C(C)C)C(=O)N[CH2]C(=O)N[C@@H](C(C)C)C(=O)N[CH2]C(=O)N[CH2]C1(=O)"
     },
     {
       "name": "Cyclo-(AVGGVG)",
       "sequence": "AVGGVG",
-      "smiles": "N1[C@H](C)C(=O)N[C@H](C(C)C)C(=O)N[CH2]C(=O)N[CH2]C(=O)N[C@H](C(C)C)C(=O)N[CH2]C1(=O)"
+      "smiles": "N1[C@@H](C)C(=O)N[C@@H](C(C)C)C(=O)N[CH2]C(=O)N[CH2]C(=O)N[C@@H](C(C)C)C(=O)N[CH2]C1(=O)"
     },
     {
       "name": "Cyclo-(TVGGVG)",
       "sequence": "TVGGVG",
-      "smiles": "N1[C@H](C(O)C)C(=O)N[C@H](C(C)C)C(=O)N[CH2]C(=O)N[CH2]C(=O)N[C@H](C(C)C)C(=O)N[CH2]C1(=O)"
+      "smiles": "N1[C@@H](C(O)C)C(=O)N[C@@H](C(C)C)C(=O)N[CH2]C(=O)N[CH2]C(=O)N[C@@H](C(C)C)C(=O)N[CH2]C1(=O)"
     },
     {
       "name": "Cyclo-(RVRAANG)",
       "sequence": "RVRAANG",
-      "smiles": "N1[C@H](CCCNC(=[NH2+])[NH2])C(=O)N[C@H](C(C)C)C(=O)N[C@H](CCCNC(=[NH2+])[NH2])C(=O)N[C@H](C)C(=O)N[C@H](C)C(=O)N[C@H](CC(=O)[NH2])C(=O)N[CH2]C1(=O)"
+      "smiles": "N1[C@@H](CCCNC(=[NH2+])[NH2])C(=O)N[C@@H](C(C)C)C(=O)N[C@@H](CCCNC(=[NH2+])[NH2])C(=O)N[C@@H](C)C(=O)N[C@@H](C)C(=O)N[C@@H](CC(=O)[NH2])C(=O)N[CH2]C1(=O)"
     },
     {
       "name": "Cyclo-(VGVSDFV)",
       "sequence": "VGVSDFV",
-      "smiles": "N1[C@H](C(C)C)C(=O)N[CH2]C(=O)N[C@H](C(C)C)C(=O)N[C@H](CO)C(=O)N[C@H](CC(=O)[O-])C(=O)N[C@H](Cc2ccccc2)C(=O)N[C@H](C(C)C)C1(=O)"
+      "smiles": "N1[C@@H](C(C)C)C(=O)N[CH2]C(=O)N[C@@H](C(C)C)C(=O)N[C@@H](CO)C(=O)N[C@@H](CC(=O)[O-])C(=O)N[C@@H](Cc2ccccc2)C(=O)N[C@@H](C(C)C)C1(=O)"
     }
   ],
   "configuration": {
     "solvation": {
       "box_shape": "RHOMBIC_DODECAHEDRON",
       "nacl_molarity": 0.0,
-      "solvent_padding_nm": 1.4,
-      "target_density": 1.0
+      "solvent_padding_nm": 1.4
     },
     "ensemble": {
       "max_effective_temperature": 700.0,
@@ -85,9 +84,8 @@
     },
     "lengths": {
       "checkpoint_length_ns": 10.0,
-      "equilibration_length_ns": 10.0,
+      "equilibration_length_ns": 1.0,
       "frame_length_ns": 0.1,
-      "save_state_length_ns": 0.001,
       "traj_length_ns": 100.0
     }
   }
