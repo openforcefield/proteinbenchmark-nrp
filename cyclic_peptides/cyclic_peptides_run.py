@@ -15,7 +15,7 @@ logging.basicConfig(
 
 
 def main(storage: Path, checkpoint: Path):
-    LOGGER.info(f"Loading sampler from {storage}")
+    LOGGER.info(f"Loading sampler from storage file {storage} and checkpoint file {checkpoint}")
     reporter = openmmtools.multistate.MultiStateReporter(
         storage=str(storage),
         checkpoint_storage=str(checkpoint),
