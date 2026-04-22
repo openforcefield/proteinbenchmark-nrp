@@ -60,7 +60,7 @@ def main():
                     "PROTBENCH_WINDOW": 0,
                     "PROTBENCH_SCRIPT_COMMIT": script_commit,
                     "PROTBENCH_SCRIPT_PATH": SCRIPT_PATH,
-                    "PROTBENCH_SCRIPT_ARG": f"--storage={storage}",
+                    "PROTBENCH_SCRIPT_ARG": f"--storage={storage} --checkpoint={checkpoint}",
                     "PROTBENCH_REQUIRED_FILES": "\n".join(
                         [
                             str(storage),

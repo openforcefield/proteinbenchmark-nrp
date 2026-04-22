@@ -13,9 +13,14 @@ logging.basicConfig(
     format="%(asctime)s.%(msecs)03d [%(levelname)8s] %(message)s (%(filename)s:%(lineno)s via %(name)s)",
 )
 
-def main(storage: Path):
+
+def main(storage: Path, checkpoint: Path):
     LOGGER.info(f"Loading sampler from {storage}")
-    sampler = openmmtools.multistate.ReplicaExchangeSampler.from_storage(storage)
+    reporter = openmmtools.multistate.MultiStateReporter(
+        storage=str(storage),
+        checkpoint_storage=str(checkpoint),
+    )
+    sampler = openmmtools.multistate.ReplicaExchangeSampler.from_storage(reporter)
 
     LOGGER.info("Configuring platform")
     platform = openmm.Platform.getPlatformByName("CUDA")
