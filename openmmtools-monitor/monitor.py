@@ -10,6 +10,7 @@ import types
 import xml.etree.ElementTree as ET
 import zlib
 from collections.abc import Callable, Generator, Sequence
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 from datetime import datetime
 from pathlib import Path
@@ -33,81 +34,6 @@ app = App()
 
 KB_KJMOL_PER_K = 0.008314462618  # kJ/mol/K (NIST 2018 CODATA)
 
-_SPARK_HELP = [
-    # 0 — reduced U
-    ("Energy of whichever replica currently occupies state 0 (the fully-unscaled "
-     "REST2 state), converted from dimensionless reduced potential (kT) to kJ/mol. "
-     "Should fluctuate around a stable mean once the system is equilibrated; "
-     "a sustained drift indicates incomplete equilibration. "
-     "Yellow reference line: energy at the first trajectory frame."),
-    # 1 — volume
-    ("Box volume (nm\u00b3) of the replica currently in state 0. "
-     "Should fluctuate around a stable mean under the NPT barostat; "
-     "a drifting mean indicates the density has not yet equilibrated. "
-     "Yellow reference line: running mean of all observed volumes — "
-     "the best current estimate of the barostat equilibrium volume."),
-    # 2 — online \u0394F (0\u2192N-1)
-    ("Total free energy difference from state 0 (unscaled) to state N-1 (most "
-     "scaled), estimated by offline MBAR and updated at checkpoint intervals. "
-     "Values should converge quickly and remain stable; "
-     "large changes late in the run suggest insufficient sampling. "
-     "No reference line."),
-    # 3 — RMSD to first frame
-    ("Kabsch RMSD (\u00c5) of the state-0 replica vs the very first trajectory frame, "
-     "using optimal rigid-body superposition (translation + rotation). "
-     "Shows structural drift from the starting conformation. "
-     "Not a good convergence metric for flexible systems: "
-     "a flexible peptide that re-visits its starting conformation looks converged "
-     "even if large regions of conformational space are unexplored. "
-     "No reference line."),
-    # 4 — min-RMSD
-    ("For each frame: minimum Kabsch RMSD (\u00c5) to any previously seen frame. "
-     "High early on when every structure is novel; "
-     "converges to a thermal noise floor once all accessible conformations "
-     "have been visited at least once. "
-     "Yellow reference line: all-pairs minimum RMSD — the closest any two frames "
-     "have ever been, i.e. the thermal noise floor. "
-     "When the curve plateaus at the reference line, the simulation has exhausted "
-     "conformational space and is only revisiting structures within thermal fluctuations."),
-    # 5 — max-RMSD
-    ("For each frame: maximum Kabsch RMSD (\u00c5) to any previously seen frame — "
-     "the structural eccentricity of that frame within the explored ensemble. "
-     "High when a frame is far from all known structures; "
-     "stabilises once the ensemble diameter is fully covered. "
-     "Unlike min-RMSD (which measures novelty) this measures reach: "
-     "a central frame has small max-RMSD even if it is novel. "
-     "Yellow reference line: all-pairs maximum RMSD observed so far — "
-     "the structural diameter of the trajectory, which the curve converges toward."),
-    # 6 — RMSD ACF
-    ("Mean Kabsch RMSD (\u00c5) between all pairs of state-0 frames separated by a "
-     "given lag time. X-axis is logarithmic lag time (not simulation time), "
-     "so each decade of lag gets equal visual space — the rise from zero is "
-     "clearly resolved even when the plateau spans orders of magnitude longer. "
-     "Rises from 0 at lag=0 and plateaus at the structural variance of the ensemble. "
-     "The lag at which it plateaus is the conformational decorrelation time. "
-     "Faster decorrelation in REST2 vs plain MD indicates the enhanced sampling is working. "
-     "Yellow reference line: estimated plateau value (mean of the highest-lag half) — "
-     "converges toward the true ensemble structural variance as more frames accumulate."),
-    # 7 — centroid RMSD
-    ("Kabsch RMSD (\u00c5) of each state-0 frame to the centroid (mean structure) of "
-     "the entire trajectory. All frames are first superposed onto frame 0; the "
-     "centroid is then the coordinate-wise mean of the aligned ensemble. "
-     "Frames far from the centroid represent structural outliers; "
-     "a flat, low plateau indicates tight conformational clustering around a "
-     "single dominant structure, while large excursions suggest significant "
-     "conformational heterogeneity. "
-     "Yellow reference line: mean centroid RMSD across all frames."),
-    # 8 — medoid RMSD
-    ("Kabsch RMSD (\u00c5) of each state-0 frame to the medoid — the single observed "
-     "frame that minimises the sum of pairwise RMSDs to all other frames. "
-     "Unlike the coordinate-wise mean (which may be unphysical when multiple "
-     "conformational states are visited), the medoid is always a real trajectory "
-     "frame. Frames in the same conformational cluster as the medoid appear near "
-     "zero; frames in a different cluster stand out as high-RMSD outliers, making "
-     "this a sensitive indicator of multi-state behaviour. "
-     "Yellow reference line: mean medoid RMSD across all frames."),
-]
-
 _BAR_CHARS = " ▁▂▃▄▅▆▇█"  # index by round(fraction * 6); max displayed is ▆ (index 6)
 
 _CP_RED    = 1
@@ -117,36 +43,53 @@ _CP_BLUE   = 4
 _CP_GREY   = 5
 _CP_DIM    = 6  # dimmed colour for reference line
 
-# 256-colour gradient: red → yellow → green (sweet spot ~25%) → blue (over-mixed)
+# 256-colour gradient key points — r/g/b in 0-5 (256-colour cube)
+# gradient_fraction = sqrt(rate / 100), so:
+#   frac 0.00 → rate  0%
+#   frac 0.32 → rate 10%
+#   frac 0.50 → rate 25%  ← sweet spot
+#   frac 0.71 → rate 50%
+#   frac 1.00 → rate 100%
 _N_GRADIENT = 24
 _CP_GRADIENT_START = 7
 
-_GRADIENT_KEY_POINTS = [
-    # (gradient_fraction, r, g, b)  — r/g/b in 0-5 (256-colour cube)
-    # gradient_fraction = sqrt(rate / 100), so:
-    #   frac 0.00 → rate  0%
-    #   frac 0.32 → rate 10%
-    #   frac 0.50 → rate 25%  ← sweet spot
-    #   frac 0.71 → rate 50%
-    #   frac 1.00 → rate 100%
+# Default: near-black → bright blue (1%) → light cyan (10%) → near-white (25%) → gold → brown
+# Explicit key point at frac=0.10 (rate=1%) creates a visible inflection so the
+# 1–10% range (bright blue→cyan) is clearly distinct from the 0–1% range (near-black→blue).
+# No red/green contrast — safe for deuteranopia, protanopia, and tritanopia.
+_GRADIENT_KEY_POINTS: list[tuple[float, int, int, int]] = [
+    (0.00, 0, 0, 1),  # rate  0%  near-black navy
+    (0.10, 0, 3, 5),  # rate  1%  bright blue      ← inflection: 1–10% starts here
+    (0.32, 2, 5, 5),  # rate 10%  light cyan
+    (0.50, 4, 5, 5),  # rate 25%  near-white       ← sweet spot
+    (0.75, 5, 4, 1),  # rate 56%  pale gold
+    (1.00, 3, 2, 0),  # rate 100% muted brown
+]
+
+# Classic: red → orange → green (sweet spot) → teal → blue
+# Vivid and intuitive on standard displays; not suitable for red/green
+# colour blindness.  Enabled with --no-colorblind-mode.
+_GRADIENT_KEY_POINTS_CLASSIC: list[tuple[float, int, int, int]] = [
     (0.00, 5, 0, 0),  # rate  0%  red
     (0.32, 5, 4, 0),  # rate 10%  orange
-    (0.50, 0, 5, 0),  # rate 25%  green  ← sweet spot
+    (0.50, 0, 5, 0),  # rate 25%  green            ← sweet spot
     (0.75, 0, 2, 4),  # rate 56%  teal
     (1.00, 0, 0, 5),  # rate 100% blue
 ]
 
 
-def _init_gradient_pairs() -> list[int]:
+def _init_gradient_pairs(
+    key_points: list[tuple[float, int, int, int]],
+) -> list[int]:
     """Initialise _N_GRADIENT curses color pairs for the acceptance rate gradient."""
     pairs = []
     for i in range(_N_GRADIENT):
         t = i / (_N_GRADIENT - 1)
         # Fallback to last key point (handles t==1.0 exactly)
-        _, r, g, b = _GRADIENT_KEY_POINTS[-1]
-        for j in range(len(_GRADIENT_KEY_POINTS) - 1):
-            t0, r0, g0, b0 = _GRADIENT_KEY_POINTS[j]
-            t1, r1, g1, b1 = _GRADIENT_KEY_POINTS[j + 1]
+        _, r, g, b = key_points[-1]
+        for j in range(len(key_points) - 1):
+            t0, r0, g0, b0 = key_points[j]
+            t1, r1, g1, b1 = key_points[j + 1]
             if t <= t1 + 1e-9:
                 s = (t - t0) / (t1 - t0)
                 r = round(r0 + s * (r1 - r0))
@@ -233,7 +176,7 @@ def _addstr(stdscr: curses.window, text: str, attr: int = 0) -> None:
     try:
         stdscr.addstr(text, attr) if attr else stdscr.addstr(text)
     except curses.error:
-        pass
+        pass  # raised when text reaches the bottom-right corner; harmless
 
 
 # Braille dot bit values indexed by [sub_col][sub_row].
@@ -782,20 +725,22 @@ class OpenmmToolsReader:
         try:
             opts = yaml.safe_load(str(self._nc.variables["options"][0]))
             self._n_iterations = int(opts["number_of_iterations"])
+        except (KeyError, TypeError, ValueError, yaml.YAMLError):
+            pass  # options variable absent or malformed — n_iterations stays None
         except Exception:
-            pass
+            _LOG.warning("unexpected error reading n_iterations from options", exc_info=True)
 
-        self._pos_interval = 500
+        self._pos_interval = 1
         try:
             self._pos_interval = int(self._nc.PositionInterval)
         except AttributeError:
-            pass
+            pass  # optional NC global attribute; default 1 (conservative: read every iteration)
 
-        self._vel_interval = 500
+        self._vel_interval = 1
         try:
             self._vel_interval = int(self._nc.VelocityInterval)
         except AttributeError:
-            pass
+            pass  # optional NC global attribute; default 1 (conservative: read every iteration)
 
         self._has_t_kin     = has_ap and "velocities" in self._nc.variables
         self._has_volume    = "volumes"    in self._nc.variables
@@ -836,14 +781,14 @@ class OpenmmToolsReader:
         try:
             self._nc.close()
         except RuntimeError:
-            pass
+            pass  # netCDF4 raises RuntimeError if the file is already closed
         self._nc = netCDF4.Dataset(str(self._storage), "r")
 
     def close(self) -> None:
         try:
             self._nc.close()
         except RuntimeError:
-            pass
+            pass  # netCDF4 raises RuntimeError if the file is already closed
 
     # ── Iteration bookkeeping ──────────────────────────────────────────────
 
@@ -906,7 +851,10 @@ class OpenmmToolsReader:
     def timestamp(self, iteration: int) -> float | None:
         try:
             return _parse_timestamp(str(self._nc.variables["timestamp"][iteration]))  # type: ignore[union-attr]
+        except (OSError, IndexError, RuntimeError, ValueError):
+            return None  # missing or unreadable timestamp — caller treats None as unavailable
         except Exception:
+            _LOG.warning("unexpected error reading timestamp at iteration %d", iteration, exc_info=True)
             return None
 
     # ── Range reads ────────────────────────────────────────────────────────
@@ -982,6 +930,7 @@ def _init_state(
         n_states=n_states,
         n_steps=reader.steps_per_iter,
         timestep_ps=reader.timestep_ps,
+        ref_temp_k=reader.ref_temp_k,
         kt_kjmol=reader.ref_temp_k * KB_KJMOL_PER_K,
         n_iterations=n_iterations,
         has_t_kin=reader.has_t_kin,
@@ -1079,7 +1028,7 @@ def _handle_key(key: int, S: types.SimpleNamespace) -> tuple[bool, bool]:
                 S.scrub_iter  = target
                 S.scrub_dirty = True
             except ValueError:
-                pass
+                pass  # user typed a non-integer; silently discard and close the prompt
             S.scrub_input_active = False
             S.scrub_input_buf    = ""
             return True, False
@@ -1139,15 +1088,15 @@ def _handle_key(key: int, S: types.SimpleNamespace) -> tuple[bool, bool]:
         if key == ord("q"):
             return False, True
         elif key == ord("s"):
-            S.sparkline_mode = (S.sparkline_mode + 1) % len(_SPARK_HELP)
+            S.sparkline_mode = (S.sparkline_mode + 1) % len(_SPARK_MODES)
             return True, False
         elif key == ord("S"):
-            S.sparkline_mode = (S.sparkline_mode - 1) % len(_SPARK_HELP)
+            S.sparkline_mode = (S.sparkline_mode - 1) % len(_SPARK_MODES)
             return True, False
         elif key == ord("?"):
             S.show_spark_help = not S.show_spark_help
             return True, False
-        elif key == ord("a") and S.sparkline_mode in (3, 4, 5, 6, 7, 8):
+        elif key == ord("a") and _SPARK_MODES[S.sparkline_mode].needs_atoms:
             S.rmsd_input_active = True
             S.rmsd_input_buf = S.solute_sel_str
             S.rmsd_sel_error = ""
@@ -1224,11 +1173,292 @@ class TaskRunner:
                 worked = True
                 self._tasks.append(task)   # re-queue for round-robin
             except StopIteration:
-                pass                        # task finished — not re-queued
+                pass  # task finished normally — not re-queued
         return worked
 
     def __bool__(self) -> bool:
         return bool(self._tasks)
+
+
+# ── Sparkline mode registry ────────────────────────────────────────────────────
+
+
+@dataclass
+class SparkMode:
+    """All per-mode data for a single sparkline graph.
+
+    Adding a new graph means adding one ``SparkMode`` entry to ``_SPARK_MODES``.
+    Nothing else needs updating: mode count, key cycling, atom-selection guards,
+    data dispatch, reference line, poll submission, and help text are all derived
+    from this list automatically.
+    """
+
+    name: str
+    unit: str
+    help_text: str
+    # Callable signatures:
+    #   get_data(S, spark_w)  -> (iters, vals)
+    #   get_ref(S, vals)      -> float | None
+    #   get_grid(S, sp_iters, total_iters) -> (grid_total, xaxis_l, xaxis_r)
+    #                            None = use standard time axis
+    #   xaxis_m_fn(S)         -> centre-label string (overrides auto dot-density label)
+    #   poll(S, runner)       -> None  (submit background recompute tasks as needed)
+    get_data: Callable[..., tuple[list[int], list[float]]] = field(repr=False)
+    get_ref:  Callable[..., float | None]                  = field(repr=False)
+    needs_atoms:    bool = False
+    individual_dots: bool = False
+    x_transform: Callable[[float], float] | None = field(default=None, repr=False)
+    multistate:   bool = False   # "State 0→N" prefix instead of "State 0"
+    uses_history: bool = False   # show "loading history…" progress in title
+    get_grid:    Callable[..., tuple[int, str, str]] | None = field(default=None, repr=False)
+    xaxis_m_fn:  Callable[..., str] | None                  = field(default=None, repr=False)
+    poll:        Callable[..., None] | None                  = field(default=None, repr=False)
+
+
+# ── get_data helpers ───────────────────────────────────────────────────────────
+
+def _data_ground_u(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
+    return S.ground_u_iters, S.ground_u_history
+
+def _data_ground_vol(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
+    return S.ground_vol_iters, S.ground_vol_history
+
+def _data_fe(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
+    return getattr(S, "fe_iters", []), getattr(S, "fe_vals", [])
+
+def _data_rmsd(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
+    if S.n_pos_frames:
+        vals = [0.0] + [S.pairwise_rmsd_mat[i][0] for i in range(1, S.n_pos_frames)]
+        return S.pos_frame_iters, vals
+    return [], []
+
+def _data_min_rmsd(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
+    if S.n_pos_frames > 1:
+        return S.pos_frame_iters[1:], [min(S.pairwise_rmsd_mat[i]) for i in range(1, S.n_pos_frames)]
+    return [], []
+
+def _data_max_rmsd(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
+    if S.n_pos_frames > 1:
+        return S.pos_frame_iters[1:], [max(S.pairwise_rmsd_mat[i]) for i in range(1, S.n_pos_frames)]
+    return [], []
+
+def _data_acf(S: types.SimpleNamespace, spark_w: int) -> tuple[list[int], list[float]]:
+    if S.n_pos_frames < 2:
+        return [], []
+    max_lag = S.n_pos_frames // 2
+    n_pts   = min(max_lag, max(4, 2 * spark_w))
+    raw_lags = np.unique(np.round(np.geomspace(1, max_lag, n_pts)).astype(int))
+    raw_lags = raw_lags[(raw_lags >= 1) & (raw_lags <= max_lag)]
+    vals = [
+        float(np.mean([S.pairwise_rmsd_mat[i + int(lag)][i]
+                        for i in range(S.n_pos_frames - int(lag))]))
+        for lag in raw_lags
+    ]
+    return [int(lag) for lag in raw_lags], vals
+
+def _data_centroid_rmsd(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
+    n = S.centroid_n_frames_cached
+    return S.pos_frame_iters[:n], S.centroid_rmsd_cache
+
+def _data_medoid_rmsd(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
+    n = S.medoid_n_frames_cached
+    return S.pos_frame_iters[:n], S.medoid_rmsd_cache
+
+
+# ── get_ref helpers ────────────────────────────────────────────────────────────
+
+def _ref_none(S: types.SimpleNamespace, vals: list[float]) -> float | None:
+    return None
+
+def _ref_first(S: types.SimpleNamespace, vals: list[float]) -> float | None:
+    return vals[0] if vals else None
+
+def _ref_mean(S: types.SimpleNamespace, vals: list[float]) -> float | None:
+    return float(np.mean(vals)) if vals else None
+
+def _ref_min_pairwise(S: types.SimpleNamespace, vals: list[float]) -> float | None:
+    return (min(v for row in S.pairwise_rmsd_mat for v in row)
+            if S.n_pos_frames >= 2 else None)
+
+def _ref_max_pairwise(S: types.SimpleNamespace, vals: list[float]) -> float | None:
+    return (max(v for row in S.pairwise_rmsd_mat for v in row)
+            if S.n_pos_frames >= 2 else None)
+
+def _ref_acf_plateau(S: types.SimpleNamespace, vals: list[float]) -> float | None:
+    if len(vals) >= 4:
+        half = len(vals) // 2
+        return float(np.mean(vals[half:]))
+    return None
+
+
+# ── get_grid / xaxis_m helpers (ACF only needs custom grid) ───────────────────
+
+def _grid_acf(
+    S: types.SimpleNamespace, sp_iters: list[int], total_iters: int
+) -> tuple[int, str, str]:
+    frame_ps = S.pos_interval * S.n_steps * S.timestep_ps
+    if not sp_iters:
+        total_ns = total_iters * S.n_steps * S.timestep_ps / 1000
+        return total_iters, "0 ns", f"{total_ns:.1f} ns"
+    acf_max_lag = max(sp_iters)
+    return (
+        acf_max_lag,
+        f"lag {_fmt_2sf(frame_ps / 1000)}ns (log)",
+        f"lag {acf_max_lag * frame_ps / 1000:.1f}ns",
+    )
+
+def _xaxis_m_acf(S: types.SimpleNamespace) -> str:
+    return f"{S.n_pos_frames} frames" if S.n_pos_frames else ""
+
+
+# ── poll helpers ───────────────────────────────────────────────────────────────
+
+def _poll_centroid(S: types.SimpleNamespace, runner: TaskRunner) -> None:
+    if (not S.centroid_computing
+            and S.pos_all_frames
+            and len(S.pos_all_frames) != S.centroid_n_frames_cached):
+        S.centroid_computing = True
+        runner.submit(_centroid_rmsd_gen(S))
+
+def _poll_medoid(S: types.SimpleNamespace, runner: TaskRunner) -> None:
+    if (not S.medoid_computing
+            and S.n_pos_frames >= 2
+            and S.n_pos_frames != S.medoid_n_frames_cached):
+        S.medoid_computing = True
+        runner.submit(_medoid_rmsd_gen(S))
+
+
+# ── Mode registry ──────────────────────────────────────────────────────────────
+
+_SPARK_MODES: list[SparkMode] = [
+    SparkMode(
+        name="reduced U", unit="kJ/mol",
+        help_text=(
+            "Energy of whichever replica currently occupies state 0, "
+            "converted from dimensionless reduced potential (kT) to kJ/mol. "
+            "Should fluctuate around a stable mean once the system is equilibrated; "
+            "a sustained drift indicates incomplete equilibration. "
+            "Yellow reference line: energy at the first trajectory frame."
+        ),
+        get_data=_data_ground_u, get_ref=_ref_first,
+        uses_history=True,
+    ),
+    SparkMode(
+        name="volume", unit="nm\u00b3",
+        help_text=(
+            "Box volume (nm\u00b3) of the replica currently in state 0. "
+            "Should fluctuate around a stable mean under the NPT barostat; "
+            "a drifting mean indicates the density has not yet equilibrated. "
+            "Yellow reference line: running mean of all observed volumes \u2014 "
+            "the best current estimate of the barostat equilibrium volume."
+        ),
+        get_data=_data_ground_vol, get_ref=_ref_mean,
+        uses_history=True,
+    ),
+    SparkMode(
+        name="online \u0394F", unit="kT",
+        help_text=(
+            "Total free energy difference from state 0 to state N-1, "
+            "estimated by offline MBAR and updated at checkpoint intervals. "
+            "Values should converge quickly and remain stable; "
+            "large changes late in the run suggest insufficient sampling. "
+            "No reference line."
+        ),
+        get_data=_data_fe, get_ref=_ref_none,
+        multistate=True, uses_history=True,
+    ),
+    SparkMode(
+        name="RMSD", unit="\u00c5",
+        help_text=(
+            "Kabsch RMSD (\u00c5) of the state-0 replica vs the very first trajectory frame, "
+            "using optimal rigid-body superposition (translation + rotation). "
+            "Shows structural drift from the starting conformation. "
+            "Not a good convergence metric for flexible systems: "
+            "a flexible peptide that re-visits its starting conformation looks converged "
+            "even if large regions of conformational space are unexplored. "
+            "No reference line."
+        ),
+        get_data=_data_rmsd, get_ref=_ref_none,
+        needs_atoms=True,
+    ),
+    SparkMode(
+        name="min-RMSD", unit="\u00c5",
+        help_text=(
+            "For each frame: minimum Kabsch RMSD (\u00c5) to any previously seen frame. "
+            "High early on when every structure is novel; "
+            "converges to a thermal noise floor once all accessible conformations "
+            "have been visited at least once. "
+            "Yellow reference line: all-pairs minimum RMSD \u2014 the closest any two frames "
+            "have ever been, i.e. the thermal noise floor. "
+            "When the curve plateaus at the reference line, the simulation has exhausted "
+            "conformational space and is only revisiting structures within thermal fluctuations."
+        ),
+        get_data=_data_min_rmsd, get_ref=_ref_min_pairwise,
+        needs_atoms=True,
+    ),
+    SparkMode(
+        name="max-RMSD", unit="\u00c5",
+        help_text=(
+            "For each frame: maximum Kabsch RMSD (\u00c5) to any previously seen frame \u2014 "
+            "the structural eccentricity of that frame within the explored ensemble. "
+            "High when a frame is far from all known structures; "
+            "stabilises once the ensemble diameter is fully covered. "
+            "Unlike min-RMSD (which measures novelty) this measures reach: "
+            "a central frame has small max-RMSD even if it is novel. "
+            "Yellow reference line: all-pairs maximum RMSD observed so far \u2014 "
+            "the structural diameter of the trajectory, which the curve converges toward."
+        ),
+        get_data=_data_max_rmsd, get_ref=_ref_max_pairwise,
+        needs_atoms=True,
+    ),
+    SparkMode(
+        name="centroid RMSD", unit="\u00c5",
+        help_text=(
+            "Kabsch RMSD (\u00c5) of each state-0 frame to the centroid (mean structure) of "
+            "the entire trajectory. All frames are first superposed onto frame 0; the "
+            "centroid is then the coordinate-wise mean of the aligned ensemble. "
+            "Frames far from the centroid represent structural outliers; "
+            "a flat, low plateau indicates tight conformational clustering around a "
+            "single dominant structure, while large excursions suggest significant "
+            "conformational heterogeneity. "
+            "Yellow reference line: mean centroid RMSD across all frames."
+        ),
+        get_data=_data_centroid_rmsd, get_ref=_ref_mean,
+        needs_atoms=True, poll=_poll_centroid,
+    ),
+    SparkMode(
+        name="medoid RMSD", unit="\u00c5",
+        help_text=(
+            "Kabsch RMSD (\u00c5) of each state-0 frame to the medoid \u2014 the single observed "
+            "frame that minimises the sum of pairwise RMSDs to all other frames. "
+            "Unlike the coordinate-wise mean (which may be unphysical when multiple "
+            "conformational states are visited), the medoid is always a real trajectory "
+            "frame. Frames in the same conformational cluster as the medoid appear near "
+            "zero; frames in a different cluster stand out as high-RMSD outliers, making "
+            "this a sensitive indicator of multi-state behaviour. "
+            "Yellow reference line: mean medoid RMSD across all frames."
+        ),
+        get_data=_data_medoid_rmsd, get_ref=_ref_mean,
+        needs_atoms=True, poll=_poll_medoid,
+    ),
+    SparkMode(
+        name="RMSD ACF", unit="\u00c5",
+        help_text=(
+            "Mean Kabsch RMSD (\u00c5) between all pairs of state-0 frames separated by a "
+            "given lag time. X-axis is logarithmic lag time (not simulation time), "
+            "so each decade of lag gets equal visual space \u2014 the rise from zero is "
+            "clearly resolved even when the plateau spans orders of magnitude longer. "
+            "Rises from 0 at lag=0 and plateaus at the structural variance of the ensemble. "
+            "The lag at which it plateaus is the conformational decorrelation time. "
+            "Faster decorrelation indicates more effective conformational sampling. "
+            "Yellow reference line: estimated plateau value (mean of the highest-lag half) \u2014 "
+            "converges toward the true ensemble structural variance as more frames accumulate."
+        ),
+        get_data=_data_acf, get_ref=_ref_acf_plateau,
+        needs_atoms=True, individual_dots=True, x_transform=math.log10,
+        get_grid=_grid_acf, xaxis_m_fn=_xaxis_m_acf,
+    ),
+]
 
 
 _HISTORY_CHUNK = 2000  # iterations per yield in _history_scan_gen
@@ -1397,7 +1627,7 @@ def _rmsd_gen(
                     S.pos_frame_iters.append(abs_i)
                     S.n_pos_frames = len(S.pos_all_frames)
             except (OSError, IndexError, RuntimeError, np.linalg.LinAlgError):
-                pass
+                _LOG.debug("skipping RMSD frame at iter %d", abs_i, exc_info=True)
             yield
     finally:
         S.rmsd_computing = False
@@ -1553,7 +1783,7 @@ def _poll(reader: SimulationReader, S: types.SimpleNamespace, stdscr: curses.win
                         f" (~{_fmt_duration(remaining_s)} remaining)"
                     )
     except Exception:
-        pass
+        _LOG.warning("error computing timing/ETA string", exc_info=True)
 
     # Per-replica T_kin and Volume at display_iter — only when history is fully
     # loaded so we don't jump to the final value while the scan is in progress.
@@ -1661,90 +1891,19 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
     _term_rows, _term_cols = stdscr.getmaxyx()
     spark_w = max(10, _term_cols - matrix_w - len(sep) - 1)
 
-    _SPARK_NAMES = ["reduced U", "volume", "online ΔF", "RMSD", "min-RMSD", "max-RMSD", "RMSD ACF", "centroid RMSD", "medoid RMSD"]
-    _SPARK_UNITS = ["kJ/mol",   "nm³",    "kT",        "Å",    "Å",        "Å",         "Å",        "Å",             "Å"]
-
-    # Derive sparkline data from cached state based on current mode
+    # Derive sparkline data, reference line, and axis labels from the mode registry
     mode = S.sparkline_mode
-    _acf_max_lag: int = 0  # only used when mode == 6; set below
-    if mode == 0:
-        sp_iters, sp_vals = S.ground_u_iters, S.ground_u_history
-    elif mode == 1:
-        sp_iters, sp_vals = S.ground_vol_iters, S.ground_vol_history
-    elif mode == 2:
-        # online ΔF is stored in S.fe_iters / S.fe_vals by _poll each cycle.
-        sp_iters = getattr(S, "fe_iters", [])
-        sp_vals  = getattr(S, "fe_vals",  [])
-    elif mode == 3:
-        if S.n_pos_frames:
-            sp_iters = S.pos_frame_iters
-            sp_vals  = [0.0] + [S.pairwise_rmsd_mat[i][0] for i in range(1, S.n_pos_frames)]
-        else:
-            sp_iters, sp_vals = [], []
-    elif mode == 4:
-        if S.n_pos_frames > 1:
-            sp_iters = S.pos_frame_iters[1:]
-            sp_vals  = [min(S.pairwise_rmsd_mat[i]) for i in range(1, S.n_pos_frames)]
-        else:
-            sp_iters, sp_vals = [], []
-    elif mode == 5:  # max-RMSD: running maximum pairwise RMSD
-        if S.n_pos_frames > 1:
-            sp_iters = S.pos_frame_iters[1:]
-            sp_vals = [max(S.pairwise_rmsd_mat[i]) for i in range(1, S.n_pos_frames)]
-        else:
-            sp_iters, sp_vals = [], []
-    elif mode == 7:  # centroid RMSD — reads from cache filled by _centroid_rmsd_gen
-        n_cached = S.centroid_n_frames_cached
-        sp_iters = S.pos_frame_iters[:n_cached]
-        sp_vals  = S.centroid_rmsd_cache
-    elif mode == 8:  # medoid RMSD — reads from cache filled by _medoid_rmsd_gen
-        n_cached = S.medoid_n_frames_cached
-        sp_iters = S.pos_frame_iters[:n_cached]
-        sp_vals  = S.medoid_rmsd_cache
-    else:  # mode == 6 — ACF (log x-axis for adaptive resolution)
-        if S.n_pos_frames >= 2:
-            max_lag = S.n_pos_frames // 2
-            # Geometrically-spaced lags: dense where ACF rises, sparse at plateau.
-            # 2*spark_w points matches the braille sub-column resolution.
-            n_pts = min(max_lag, max(4, 2 * spark_w))
-            raw_lags = np.unique(np.round(np.geomspace(1, max_lag, n_pts)).astype(int))
-            raw_lags = raw_lags[(raw_lags >= 1) & (raw_lags <= max_lag)]
-            sp_vals = []
-            for lag in raw_lags:
-                pairs = [S.pairwise_rmsd_mat[i + int(lag)][i] for i in range(S.n_pos_frames - int(lag))]
-                sp_vals.append(float(np.mean(pairs)))
-            # Store raw integer lags; log10 transform is applied inside _build_sparkline_grid
-            sp_iters     = [int(lag) for lag in raw_lags]
-            _acf_max_lag = int(raw_lags[-1])
-        else:
-            sp_iters, sp_vals, _acf_max_lag = [], [], 0
+    m    = _SPARK_MODES[mode]
 
-    # Reference line value (mode-specific)
-    if mode == 0 and sp_vals:
-        sp_ref_val: float | None = sp_vals[0]
-    elif mode == 1 and sp_vals:
-        sp_ref_val = float(np.mean(sp_vals))
-    elif mode == 4 and S.n_pos_frames >= 2:
-        sp_ref_val = min(v for row in S.pairwise_rmsd_mat for v in row)
-    elif mode == 5 and S.n_pos_frames >= 2:
-        sp_ref_val = max(v for row in S.pairwise_rmsd_mat for v in row)
-    elif mode == 6 and len(sp_vals) >= 4:
-        half = len(sp_vals) // 2
-        sp_ref_val = float(np.mean(sp_vals[half:]))
-    elif mode in (7, 8) and sp_vals:
-        sp_ref_val = float(np.mean(sp_vals))
-    else:
-        sp_ref_val = None
+    sp_iters, sp_vals = m.get_data(S, spark_w)
+    sp_ref_val        = m.get_ref(S, sp_vals)
 
     # x-axis labels and grid_total (must precede n_per_unit which uses grid_total)
-    if mode == 6 and sp_iters:
-        grid_total = _acf_max_lag  # integer max lag; log10 applied inside sparkline
-        _frame_ps = S.pos_interval * S.n_steps * S.timestep_ps
-        xaxis_l = f"lag {_fmt_2sf(_frame_ps / 1000)}ns (log)"
-        xaxis_r = f"lag {_acf_max_lag * _frame_ps / 1000:.1f}ns"
+    total_ns = total_iters * S.n_steps * S.timestep_ps / 1000
+    if m.get_grid is not None:
+        grid_total, xaxis_l, xaxis_r = m.get_grid(S, sp_iters, total_iters)
     else:
         grid_total = total_iters
-        total_ns = total_iters * S.n_steps * S.timestep_ps / 1000
         xaxis_l = "0 ns"
         xaxis_r = f"{total_ns:.1f} ns"
 
@@ -1752,15 +1911,15 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
     # bins (dots that actually get drawn), not total possible positions — dots
     # with no data are never shown so they shouldn't count in the denominator.
     n_per_unit: float | None = None
-    if mode != 6 and spark_w > 0 and sp_vals and grid_total > 0:
+    if not m.individual_dots and spark_w > 0 and sp_vals and grid_total > 0:
         _use_braille = len(sp_vals) >= spark_w
         _n_bins = 2 * spark_w if _use_braille else spark_w
         _filled = len({min(int(it / grid_total * _n_bins), _n_bins - 1) for it in sp_iters})
         if _filled > 0:
             n_per_unit = len(sp_vals) / _filled
 
-    if mode == 6:
-        xaxis_m = f"{S.n_pos_frames} frames" if S.n_pos_frames else ""
+    if m.xaxis_m_fn is not None:
+        xaxis_m = m.xaxis_m_fn(S)
     elif n_per_unit is not None and n_per_unit > _SPARK_DOTS_THRESHOLD:
         xaxis_m = f"~{_fmt_2sf(n_per_unit)}/dot"
     else:
@@ -1773,25 +1932,24 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
         cp_range=curses.color_pair(_CP_GREY),
         cp_ref=curses.color_pair(_CP_DIM),
         ref_val=sp_ref_val,
-        x_transform=math.log10 if mode == 6 else None,
-        individual_dots=mode == 6,
+        x_transform=m.x_transform,
+        individual_dots=m.individual_dots,
     )
 
     # Scrub cursor: blue vertical bar only on empty cells (never overwrites data)
-    if _scrubbing and mode != 6 and grid_total > 0:
+    if _scrubbing and not m.individual_dots and grid_total > 0:
         cur_col  = max(0, min(spark_w - 1, int(S.scrub_iter / grid_total * spark_w)))
         cur_attr = curses.color_pair(_CP_BLUE)
         for r in range(n_states):
             if spark_grid[r][cur_col][0] == " ":
                 spark_grid[r][cur_col] = ("│", cur_attr)
 
-    sp_name   = _SPARK_NAMES[mode]
-    sp_unit   = _SPARK_UNITS[mode]
-    sp_prefix = f"State 0→{n_states-1} {sp_name}" if mode == 2 else f"State 0 {sp_name}"
+    sp_prefix = (f"State 0\u2192{n_states-1} {m.name}" if m.multistate
+                 else f"State 0 {m.name}")
 
-    if mode in (3, 4, 5, 6, 7, 8) and S.solute_atom_sel is None:
+    if m.needs_atoms and S.solute_atom_sel is None:
         spark_title = f"{sp_prefix}  (press 'a' to set atom selection)"
-    elif mode in (3, 4, 5, 6, 7, 8):
+    elif m.needs_atoms:
         n_frames_total = display_iter // S.pos_interval + 1
         if S.n_pos_frames < n_frames_total:
             pct = S.n_pos_frames / n_frames_total * 100
@@ -1800,14 +1958,14 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
                 f"  {S.n_pos_frames}/{n_frames_total} frames)"
             )
         elif sp_vals:
-            spark_title = f"{sp_prefix}  [{spark_ymin:.4g}, {spark_ymax:.4g}] {sp_unit}"
+            spark_title = f"{sp_prefix}  [{spark_ymin:.4g}, {spark_ymax:.4g}] {m.unit}"
         else:
             spark_title = f"{sp_prefix}  (accumulating...)"
-    elif S.history_computing and mode in (0, 1, 2):
+    elif S.history_computing and m.uses_history:
         pct = (S.last_mixed_iter + 1) / (display_iter + 1) * 100
         spark_title = f"{sp_prefix}  (loading history... {pct:.0f}%)"
     elif sp_vals:
-        spark_title = f"{sp_prefix}  [{spark_ymin:.4g}, {spark_ymax:.4g}] {sp_unit}"
+        spark_title = f"{sp_prefix}  [{spark_ymin:.4g}, {spark_ymax:.4g}] {m.unit}"
     else:
         spark_title = f"{sp_prefix}  (accumulating...)"
 
@@ -1815,7 +1973,10 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
     matrix_hdr = "Exchange acceptance (%):"
     _addstr(stdscr, matrix_hdr, curses.A_BOLD)
     _addstr(stdscr, " " * (matrix_w - len(matrix_hdr)) + sep)
-    _addstr(stdscr, spark_title + "\n", curses.A_BOLD)
+    _title_lines = textwrap.wrap(spark_title, width=spark_w) or [""]
+    _addstr(stdscr, _title_lines[0] + "\n", curses.A_BOLD)
+    for _tl in _title_lines[1:]:
+        _addstr(stdscr, " " * (matrix_w + len(sep)) + _tl + "\n", curses.A_BOLD)
 
     # Column header + x-axis (left label | dim centre annotation | right label)
     _addstr(stdscr, f"  {'':>5}" + "".join(f"{i:>{col_w}}" for i in range(n_states)))
@@ -1850,7 +2011,7 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
         _addstr(stdscr, "\n")
 
     if S.show_spark_help:
-        help_text = _SPARK_HELP[mode]
+        help_text = m.help_text
         if n_per_unit is not None and n_per_unit > _SPARK_DOTS_THRESHOLD:
             help_text += " Green dots are means; white dots are min/max range."
         indent = " " * (matrix_w + len(sep))
@@ -1881,7 +2042,52 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
     _tkin_hdr = "T_kin (K)*" if _show_tkin_star else "T_kin (K) "
     _vol_hdr  = "Volume (nm³)*" if _show_vol_star else "Volume (nm³) "
 
+    # ── Simulation info box (drawn to the right of the replica table) ─────────
+    # Table width: 2+7+2+5+2+18+2+10+2+13+2+visits_w+2+5 = 72+visits_w
+    _table_w   = 72 + visits_w
+    _box_avail = _term_cols - 1 - _table_w   # chars available for the box
+
+    _iter_ps = S.n_steps * S.timestep_ps
+    _pos_ps  = S.pos_interval * S.n_steps * S.timestep_ps
+
+    def _fmt_ps(ps: float) -> str:
+        return f"{_fmt_2sf(ps / 1000)} ns" if ps >= 1000 else f"{_fmt_2sf(ps)} ps"
+
+    _sim_info: list[tuple[str, str]] = [
+        ("Replicas",    str(n_replicas)),
+        ("States",      str(n_states)),
+        ("Ref. temp.",  f"{S.ref_temp_k:.4g} K"),
+        ("Timestep",    f"{S.timestep_ps:.4g} ps"),
+        ("Steps/iter",  f"{S.n_steps:,}"),
+        ("Iter. time",  _fmt_ps(_iter_ps)),
+    ]
+    if S.pos_interval > 0:
+        _sim_info.append(("Pos. every", _fmt_ps(_pos_ps)))
+    if S.vel_interval > 0:
+        _sim_info.append(("Vel. every", _fmt_ps(S.vel_interval * S.n_steps * S.timestep_ps)))
+    if S.n_atoms > 0:
+        _sim_info.append(("Atoms", f"{S.n_atoms:,}"))
+
+    _lbl_w    = max(len(lbl) for lbl, _ in _sim_info)
+    _val_w    = max(len(val) for _, val in _sim_info)
+    _inner_w  = _lbl_w + 2 + _val_w   # "Label:  value"
+    _box_w    = _inner_w + 4           # "│ " + inner + " │"
+    _box_gap = 1
+    _draw_box = _box_avail >= _box_w + _box_gap
+    _box_col  = _table_w + _box_gap + (_box_avail - _box_w) // 2   # centred in available space
+
+    _box_lines: list[str] = []
+    if _draw_box:
+        _box_lines.append("\u250c" + "\u2500" * (_inner_w + 2) + "\u2510")
+        for _lbl, _val in _sim_info:
+            _box_lines.append(f"\u2502 {_lbl:<{_lbl_w}}  {_val:>{_val_w}} \u2502")
+        _box_lines.append("\u2514" + "\u2500" * (_inner_w + 2) + "\u2518")
+
     _addstr(stdscr, "\n")
+
+    # Capture the row the header occupies, then render header/separator normally
+    _box_start_row = stdscr.getyx()[0]
+
     _addstr(stdscr,
         f"  {'Replica':>7}  {'State':>5}  {'Reduced U (kJ/mol)':>18}  "
         f"{_tkin_hdr:>10}  {_vol_hdr:>13}  "
@@ -1926,6 +2132,19 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
         )
         _addstr(stdscr, f"{bar:>{visits_w}}", curses.color_pair(_CP_GREEN))
         _addstr(stdscr, f"  {trips:>5}\n")
+
+    # Draw info box to the right of the table using saved row position
+    if _draw_box:
+        for _bi, _bl in enumerate(_box_lines):
+            _br = _box_start_row + _bi
+            if _br >= _term_rows - 1:
+                break
+            try:
+                stdscr.move(_br, _box_col)
+                _avail = _term_cols - 1 - _box_col
+                stdscr.addstr(_bl[:_avail])
+            except curses.error:
+                pass  # terminal too narrow; skip remaining box lines
 
     _addstr(stdscr, "\n")
     _rate_iter = S.scrub_iter if _scrubbing else display_iter
@@ -1975,7 +2194,7 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
         bar        = _lhs + " " * gap + _rhs
     else:
         _z_label = "z Live" if _scrubbing else "z Freeze"
-        if mode in (3, 4, 5, 6, 7, 8):
+        if m.needs_atoms:
             sel_hint = f" ({S.solute_sel_str})" if S.solute_sel_str else ""
             bar = f"  q Quit   s/S Sparkline   ? Explain   a Atoms{sel_hint}   w/e ±1   W/E ±5%   j Jump   {_z_label}"
         else:
@@ -1985,7 +2204,7 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
         stdscr.move(_term_rows - 1, 0)
         stdscr.addstr(bar, curses.A_REVERSE)
     except curses.error:
-        pass
+        pass  # terminal too narrow to draw the full bar; truncation is acceptable
     if S.rmsd_input_active and S.rmsd_sel_error:
         _err_attr = curses.color_pair(_CP_RED) | curses.A_BOLD | curses.A_REVERSE
         try:
@@ -1998,7 +2217,7 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
                 stdscr.move(_term_rows - 1, _err_col)
                 stdscr.addstr(_err_str[:max(0, _term_cols - 1 - _err_col)], _err_attr)
         except curses.error:
-            pass
+            pass  # terminal too narrow to overlay error colouring; plain bar is still shown
 
     stdscr.refresh()
 
@@ -2013,10 +2232,12 @@ def main(
     n_iterations: int | None = None,
     solute_n_atoms: int | None = None,
     log_file: Path | None = None,
+    no_colorblind_mode: bool = False,
 ) -> None:
-    """Monitor an HREX/REST2 simulation.
+    """Monitor an REMD simulation.
 
     Pass --log-file monitor.log to enable debug timing output.
+    Pass --no-colorblind-mode to use the classic red/green acceptance heatmap.
     """
     if log_file is not None:
         logging.disable(logging.NOTSET)
@@ -2036,7 +2257,7 @@ def main(
             time.sleep(interval)
     init_sel = list(range(solute_n_atoms)) if solute_n_atoms is not None else None
     os.environ.setdefault("ESCDELAY", "25")  # reduce ESC recognition delay (default 1000ms)
-    curses.wrapper(lambda stdscr: _main(stdscr, reader, interval, n_iterations, init_sel))
+    curses.wrapper(lambda stdscr: _main(stdscr, reader, interval, n_iterations, init_sel, no_colorblind_mode))
 
 
 def _main(
@@ -2045,6 +2266,7 @@ def _main(
     interval: float,
     n_iterations_arg: int | None,
     init_atom_sel: list[int] | None,
+    no_colorblind_mode: bool = False,
 ) -> None:
     curses.curs_set(0)
     curses.start_color()
@@ -2057,7 +2279,8 @@ def _main(
     curses.init_pair(_CP_BLUE,   curses.COLOR_BLUE,   -1)
     curses.init_pair(_CP_GREY,   curses.COLOR_WHITE,  -1)
     curses.init_pair(_CP_DIM,          curses.COLOR_YELLOW, -1)
-    gradient = _init_gradient_pairs() if curses.COLORS >= 256 else None
+    _key_points = _GRADIENT_KEY_POINTS_CLASSIC if no_colorblind_mode else _GRADIENT_KEY_POINTS
+    gradient = _init_gradient_pairs(_key_points) if curses.COLORS >= 256 else None
 
     S      = _init_state(reader, n_iterations_arg, init_atom_sel, interval)
     runner = TaskRunner()
@@ -2088,6 +2311,7 @@ def _main(
             try:
                 _fetch_scrub_data(reader, S)
             except (OSError, IndexError, RuntimeError):
+                _LOG.warning("failed to fetch scrub data at iter %d; un-pinning", S.scrub_iter, exc_info=True)
                 S.scrub_iter = None
             S.scrub_dirty = False
             needs_redraw  = True
@@ -2101,7 +2325,7 @@ def _main(
                 stdscr.clear()
                 needs_redraw = True
         except OSError:
-            pass
+            pass  # can't query terminal size (e.g. not a tty); skip resize check
 
         # ── Render first — paints "Waiting…" immediately on startup so the
         #    screen is never black while a slow poll or bulk read blocks below ─
@@ -2116,7 +2340,7 @@ def _main(
                 if _poll(reader, S, stdscr):
                     needs_redraw = True
             except OSError:
-                pass
+                pass  # transient file error during refresh/poll; retry next interval
             last_poll = loop_start
 
         # ── Submit incremental tasks (idempotent: check flags before adding) ─
@@ -2138,21 +2362,9 @@ def _main(
             S.rmsd_computing = True
             runner.submit(_rmsd_gen(reader, S))
 
-        if (
-            not S.centroid_computing
-            and S.pos_all_frames
-            and len(S.pos_all_frames) != S.centroid_n_frames_cached
-        ):
-            S.centroid_computing = True
-            runner.submit(_centroid_rmsd_gen(S))
-
-        if (
-            not S.medoid_computing
-            and S.n_pos_frames >= 2
-            and S.n_pos_frames != S.medoid_n_frames_cached
-        ):
-            S.medoid_computing = True
-            runner.submit(_medoid_rmsd_gen(S))
+        for _m in _SPARK_MODES:
+            if _m.poll:
+                _m.poll(S, runner)
 
         # ── Run tasks for the rest of the 50 ms budget ─────────────────────
         # round-robin across tasks; each next() = one atomic work unit.
