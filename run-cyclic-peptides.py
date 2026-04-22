@@ -47,9 +47,9 @@ def main():
             storage = Path(f"{FF}/{target}/replica-{replica}/{src_storage.name}")
             checkpoint = Path(f"{FF}/{target}/replica-{replica}/{src_checkpoint.name}")
             (LOCAL_RESULT_DIR / storage).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(LOCAL_RESULT_DIR / src_storage, storage)
+            shutil.copyfile(src_storage, LOCAL_RESULT_DIR / storage)
             (LOCAL_RESULT_DIR / checkpoint).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(LOCAL_RESULT_DIR / src_checkpoint, checkpoint)
+            shutil.copyfile(src_checkpoint, LOCAL_RESULT_DIR / checkpoint)
 
             manifest = add_env_to_template(
                 template,
