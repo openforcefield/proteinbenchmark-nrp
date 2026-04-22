@@ -124,9 +124,7 @@ def main(config_json: Path, debug: bool = False) -> None:
             ).to_openmm(),
             save_state_length=Quantity(
                 (
-                    ensemble_config[
-                        "steps_between_exchange_attempts"
-                    ]
+                    ensemble_config["steps_between_exchange_attempts"]
                     * integration_config["timestep_fs"]
                 ),
                 "femtosecond",
@@ -173,9 +171,7 @@ def main(config_json: Path, debug: bool = False) -> None:
                     lengths_config["equilibration_length_ns"]
                     * 1_000_000
                     / integration_config["timestep_fs"]
-                    / ensemble_config[
-                        "steps_between_exchange_attempts"
-                    ],
+                    / ensemble_config["steps_between_exchange_attempts"],
                 ),
             ),
         )
