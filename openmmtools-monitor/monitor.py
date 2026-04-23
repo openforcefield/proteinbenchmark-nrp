@@ -53,6 +53,28 @@ _CP_DIM    = 6  # dimmed colour for reference line
 _N_GRADIENT = 24
 _CP_GRADIENT_START = 7
 
+# Raster display palette: up to 8 visually distinct hues for replica / cluster colouring.
+# Pairs _CP_RASTER_START … _CP_RASTER_START+7 are allocated by _init_raster_pairs().
+_N_RASTER_PALETTE = 8
+_CP_RASTER_START  = _CP_GRADIENT_START + _N_GRADIENT  # = 31
+
+# (r, g, b) in 0-5 cube — chosen to be maximally distinct and colour-blind tolerant.
+_RASTER_PALETTE: list[tuple[int, int, int]] = [
+    (0, 3, 5),  # 0 blue
+    (5, 3, 0),  # 1 orange
+    (2, 5, 2),  # 2 green
+    (5, 0, 4),  # 3 magenta
+    (0, 5, 5),  # 4 cyan
+    (5, 4, 0),  # 5 yellow
+    (4, 1, 0),  # 6 brown
+    (3, 0, 5),  # 7 purple
+]
+
+_RASTER_FALLBACK_PAIRS = [
+    _CP_BLUE, _CP_YELLOW, _CP_GREEN, _CP_RED, _CP_GREY, _CP_DIM,
+    _CP_BLUE, _CP_YELLOW,
+]
+
 # Default: near-black → bright blue (1%) → light cyan (10%) → near-white (25%) → gold → brown
 # Explicit key point at frac=0.10 (rate=1%) creates a visible inflection so the
 # 1–10% range (bright blue→cyan) is clearly distinct from the 0–1% range (near-black→blue).
@@ -76,6 +98,20 @@ _GRADIENT_KEY_POINTS_CLASSIC: list[tuple[float, int, int, int]] = [
     (0.75, 0, 2, 4),  # rate 56%  teal
     (1.00, 0, 0, 5),  # rate 100% blue
 ]
+
+
+def _init_raster_pairs() -> None:
+    """Allocate _N_RASTER_PALETTE curses color pairs for the raster cluster display."""
+    for i, (r, g, b) in enumerate(_RASTER_PALETTE):
+        color_idx = 16 + 36 * r + 6 * g + b
+        curses.init_pair(_CP_RASTER_START + i, color_idx, -1)
+
+
+def _raster_color_attr(idx: int, has_256: bool) -> int:
+    """Return the curses attr for raster palette index *idx*."""
+    if has_256:
+        return curses.color_pair(_CP_RASTER_START + (idx % _N_RASTER_PALETTE))
+    return curses.color_pair(_RASTER_FALLBACK_PAIRS[idx % len(_RASTER_FALLBACK_PAIRS)])
 
 
 def _init_gradient_pairs(
@@ -103,32 +139,11 @@ def _init_gradient_pairs(
     return pairs
 
 
-def _read_thermo_state(nc: netCDF4.Dataset) -> dict[str, Any]:
-    """Parse the first thermodynamic state from the already-open analysis nc handle."""
-    raw = b"".join(nc.groups["thermodynamic_states"].variables["state0"][:]).decode()
-    return yaml.safe_load(raw)
-
-
-def _read_mcmc_move(nc: netCDF4.Dataset) -> dict[str, Any]:
-    """Parse the MCMC moves from the already-open analysis nc handle.
-
-    One move is stored per replica. Asserts there is one move per replica and
-    that all moves are identical, then returns the first move's doc.
-    """
-    move_vars = nc.groups["mcmc_moves"].variables
-    n_replicas = nc.variables["energies"].shape[1]
-    assert len(move_vars) == n_replicas and all(
-        move_vars[f"move{i}"][0] == move_vars["move0"][0] for i in range(1, n_replicas)
-    ), f"Expected {n_replicas} identical MCMC moves, got: {list(move_vars)}"
-    return yaml.safe_load(str(move_vars["move0"][0]))
-
-
-def _load_masses_from_nc(nc: netCDF4.Dataset) -> tuple[np.ndarray[Any, np.dtype[Any]], list[tuple[int, int]], bool]:
-    """Read particle masses (amu), constraint particle pairs, and CMMotionRemover
-    presence from the standard_system in the nc file."""
-    doc = _read_thermo_state(nc)
-    system_bytes = doc["standard_system"]  # bytes, decoded by yaml !!binary
-    system_xml = zlib.decompress(system_bytes).decode()
+def _parse_masses_from_system_xml(
+    system_xml: str,
+) -> tuple[np.ndarray[Any, np.dtype[Any]], list[tuple[int, int]], bool]:
+    """Parse particle masses (amu), constraint pairs, and CMMotionRemover presence
+    from an OpenMM System XML string."""
     root = ET.fromstring(system_xml)
     particles_elem = root.find("Particles")
     assert particles_elem is not None, "System XML has no <Particles> element"
@@ -143,6 +158,163 @@ def _load_masses_from_nc(nc: netCDF4.Dataset) -> tuple[np.ndarray[Any, np.dtype[
         f.attrib.get("type") == "CMMotionRemover" for f in forces_elem
     )
     return masses, constraints, has_cm_remover
+
+
+# Atomic masses (amu) for element lookup.  Values are standard atomic weights;
+# HMR-adjusted heavy-atom masses are corrected before this table is consulted.
+_ELEMENT_MASSES: dict[str, float] = {
+    "H":  1.008,  "He":  4.003, "Li":  6.941, "Be":  9.012, "B":  10.811,
+    "C": 12.011,  "N":  14.007, "O":  15.999, "F":  18.998, "Ne": 20.180,
+    "Na": 22.990, "Mg": 24.305, "Al": 26.982, "Si": 28.086, "P":  30.974,
+    "S":  32.065, "Cl": 35.453, "Ar": 39.948, "K":  39.098, "Ca": 40.078,
+    "Fe": 55.845, "Cu": 63.546, "Zn": 65.380, "Br": 79.904, "I": 126.904,
+}
+_ELEMENT_MASS_ITEMS = sorted(_ELEMENT_MASSES.items(), key=lambda kv: kv[1])
+
+
+def _format_index_ranges(indices: list[int]) -> str:
+    """Compress a sorted list of 0-based indices into a compact range string.
+
+    E.g. [0,1,2,5,6,7] → "0-2,5-7".  Single indices are shown without a dash.
+    """
+    if not indices:
+        return ""
+    parts: list[str] = []
+    start = indices[0]
+    end   = indices[0]
+    for idx in indices[1:]:
+        if idx == end + 1:
+            end = idx
+        else:
+            parts.append(str(start) if start == end else f"{start}-{end}")
+            start = end = idx
+    parts.append(str(start) if start == end else f"{start}-{end}")
+    return ",".join(parts)
+
+
+def _nearest_element(mass: float) -> str:
+    """Return the element symbol whose standard atomic mass is closest to *mass*."""
+    return min(_ELEMENT_MASS_ITEMS, key=lambda kv: abs(kv[1] - mass))[0]
+
+
+def _hill_formula(element_counts: dict[str, int]) -> str:
+    """Return Hill-order formula string (C first, H second, then alphabetical)."""
+    counts = dict(element_counts)
+    parts: list[str] = []
+    for el in ("C", "H"):
+        if el in counts:
+            parts.append(el if counts[el] == 1 else f"{el}{counts[el]}")
+            del counts[el]
+    for el in sorted(counts):
+        parts.append(el if counts[el] == 1 else f"{el}{counts[el]}")
+    return "".join(parts)
+
+
+def _parse_system_topology(
+    system_xml: str,
+) -> list[tuple[str, list[int]]]:
+    """Parse an OpenMM System XML string and return one entry per molecule:
+    ``(hill_formula, sorted_atom_indices)``, ordered by each molecule's lowest
+    atom index.
+
+    Bond sources: ``<Constraints>`` + every ``<Force>`` whose ``type``
+    attribute contains ``"Bond"``.
+
+    HMR handling: degree-1 atoms lighter than 6 amu are identified as
+    hydrogen regardless of their exact mass.  Their median mass is used to
+    estimate how much mass was transferred so that heavy-atom masses can be
+    corrected before element lookup.
+    """
+    root = ET.fromstring(system_xml)
+
+    particles_elem = root.find("Particles")
+    assert particles_elem is not None
+    masses = [float(p.attrib["mass"]) for p in particles_elem]
+    n = len(masses)
+
+    # ── Build adjacency from all bond-like sources ────────────────────────
+    adj: list[set[int]] = [set() for _ in range(n)]
+
+    def _add_bond(p1: int, p2: int) -> None:
+        adj[p1].add(p2)
+        adj[p2].add(p1)
+
+    constraints_elem = root.find("Constraints")
+    if constraints_elem is not None:
+        for c in constraints_elem:
+            _add_bond(int(c.attrib["p1"]), int(c.attrib["p2"]))
+
+    forces_elem = root.find("Forces")
+    if forces_elem is not None:
+        for force in forces_elem:
+            if "Bond" not in force.attrib.get("type", ""):
+                continue
+            bonds_block = force.find("Bonds")
+            if bonds_block is None:
+                continue
+            for bond in bonds_block:
+                a = bond.attrib
+                # OpenMM uses p1/p2 for HarmonicBondForce; CustomBondForce uses
+                # the same convention.  Fall back to particle1/particle2 if present.
+                p1 = int(a.get("p1", a.get("particle1", -1)))
+                p2 = int(a.get("p2", a.get("particle2", -1)))
+                if p1 >= 0 and p2 >= 0:
+                    _add_bond(p1, p2)
+
+    # ── HMR-aware element assignment ──────────────────────────────────────
+    # Pass 1: identify hydrogen candidates by connectivity (degree 1) and a
+    # generous mass ceiling (6 amu) that covers standard H and HMR H up to 4×.
+    # Carbonyl / terminal oxygens also have degree 1 but mass ≥ 16 — safely above.
+    H_MASS_CEIL = 6.0
+    h_candidates: set[int] = {
+        i for i in range(n) if len(adj[i]) == 1 and masses[i] < H_MASS_CEIL
+    }
+    # Isolated light atoms (no bonds, e.g. H in H₂ after dissociation) also H.
+    h_candidates |= {i for i in range(n) if len(adj[i]) == 0 and masses[i] < H_MASS_CEIL}
+
+    # Pass 2: estimate HMR factor from median H-candidate mass.
+    if h_candidates:
+        h_mass_median = float(np.median([masses[i] for i in h_candidates]))
+        transferred_per_h = max(0.0, h_mass_median - 1.008)  # mass moved onto each H
+    else:
+        h_mass_median = 1.008
+        transferred_per_h = 0.0
+
+    # Pass 3: assign elements.
+    elements: list[str] = []
+    for i, mass in enumerate(masses):
+        if i in h_candidates:
+            elements.append("H")
+        else:
+            n_h_bonded = sum(1 for j in adj[i] if j in h_candidates)
+            corrected = mass + n_h_bonded * transferred_per_h
+            elements.append(_nearest_element(corrected))
+
+    # ── Connected components → molecules ──────────────────────────────────
+    visited = [False] * n
+    molecules: list[tuple[str, list[int]]] = []
+    for start in range(n):
+        if visited[start]:
+            continue
+        component: list[int] = []
+        stack = [start]
+        visited[start] = True
+        while stack:
+            node = stack.pop()
+            component.append(node)
+            for neighbour in adj[node]:
+                if not visited[neighbour]:
+                    visited[neighbour] = True
+                    stack.append(neighbour)
+        component.sort()
+        counts: dict[str, int] = {}
+        for idx in component:
+            el = elements[idx]
+            counts[el] = counts.get(el, 0) + 1
+        molecules.append((_hill_formula(counts), component))
+
+    molecules.sort(key=lambda m: m[1][0])
+    return molecules
 
 
 def _ke_from_velocities(velocities: np.ndarray[Any, np.dtype[Any]], masses_amu: np.ndarray[Any, np.dtype[Any]]) -> float:
@@ -194,6 +366,9 @@ _BRAILLE_BITS: list[list[int]] = [
     [0x08, 0x10, 0x20, 0x80],  # right column
 ]
 
+# Reference line characters, evenly trisecting the terminal row (top, middle, bottom).
+_REF_CHARS = ("\u203e", "\u2500", "\u005f")
+
 
 def _build_sparkline_grid(
     ground_u_iters: Sequence[int],
@@ -207,6 +382,8 @@ def _build_sparkline_grid(
     ref_val: float | None = None,
     x_transform: Callable[[int], float] | None = None,
     individual_dots: bool = False,
+    y_min_fixed: float | None = None,
+    y_max_fixed: float | None = None,
 ) -> tuple[list[list[tuple[str, int]]], float, float]:
     """Build a 2-D sparkline grid.
 
@@ -245,31 +422,39 @@ def _build_sparkline_grid(
     x_arr    = x_arr[sort_idx]
     hist_arr = hist_arr[sort_idx]
 
-    y_min = float(hist_arr.min())
-    y_max = float(hist_arr.max())
-    if ref_val is not None:
-        y_min = min(y_min, ref_val)
-        y_max = max(y_max, ref_val)
-    if y_min == y_max:
-        y_min -= 1.0
-        y_max += 1.0
-    pad = (y_max - y_min) * 0.05
-    y_min -= pad
-    y_max += pad
+    if y_min_fixed is not None and y_max_fixed is not None:
+        y_min, y_max = y_min_fixed, y_max_fixed
+    else:
+        y_min = float(hist_arr.min())
+        y_max = float(hist_arr.max())
+        if ref_val is not None:
+            y_min = min(y_min, ref_val)
+            y_max = max(y_max, ref_val)
+        if y_min == y_max:
+            y_min -= 1.0
+            y_max += 1.0
+        pad = (y_max - y_min) * 0.05
+        y_min -= pad
+        y_max += pad
 
     def _cell_row(v: float) -> int:
         """Map value to terminal row (0 = top)."""
         frac = (v - y_min) / (y_max - y_min)
         return max(0, min(height - 1, round((1.0 - frac) * (height - 1))))
 
-    # ── Sparse fallback: plain ●/│/─ characters ───────────────────────────
-    if len(ground_u_history) < width:
-        # Reference line first (lowest priority — overwritten by data)
-        if ref_val is not None:
-            ref_r = _cell_row(ref_val)
-            for c in range(width):
-                grid[ref_r][c] = ("─", cp_ref)
+    def _ref_row_and_char(v: float) -> tuple[int, str]:
+        """Map value to (terminal_row, reference_char) using a 3-way split.
 
+        The three characters evenly trisect the terminal row, independently of
+        the 4-sub-row braille mapping used for data dots."""
+        frac      = (v - y_min) / (y_max - y_min)
+        row_exact = (1.0 - frac) * (height - 1)
+        r         = max(0, min(height - 1, round(row_exact)))
+        within    = max(0.0, min(1.0 - 1e-9, row_exact - r + 0.5))
+        return r, _REF_CHARS[int(within * 3)]
+
+    # ── Sparse fallback: plain ●/│ characters ────────────────────────────
+    if len(ground_u_history) < width:
         bin_edges  = np.linspace(0.0, x_total, width + 1)
         lo_indices = np.searchsorted(x_arr, bin_edges[:-1], side="left")
         hi_indices = np.searchsorted(x_arr, bin_edges[1:],  side="left")
@@ -294,6 +479,13 @@ def _build_sparkline_grid(
                     r = _cell_row(float(v))
                     grid[r][c] = ("●", cp_mean)
 
+        # Reference line: ‾/─/_ in empty cells only, position independent of data mapping.
+        if ref_val is not None:
+            ref_r, ref_ch = _ref_row_and_char(ref_val)
+            for c in range(width):
+                if grid[ref_r][c][0] == " ":
+                    grid[ref_r][c] = (ref_ch, cp_ref)
+
         return grid, y_min, y_max
 
     # ── Dense path: braille 2×4 sub-cell resolution ───────────────────────
@@ -313,19 +505,11 @@ def _build_sparkline_grid(
     def _dot(grid2d: list[list[int]], dc: int, dr: int) -> None:
         grid2d[dr // 4][dc // 2] |= _BRAILLE_BITS[dc % 2][dr % 4]
 
-    # Reference line — rendered as a full-width horizontal stroke rather than
-    # braille dots, so it looks like a line and is visually distinct from data.
-    # Combining overline (U+0305) positions the stroke at the top of the cell;
-    # combining low line (U+0332) at the bottom; plain ─ in the middle two
-    # sub-rows.  We still track which terminal row the reference occupies so
-    # the composition step knows where to draw it.
-    ref_row: int | None = None   # terminal row
-    ref_ch:  str        = "─"   # character to draw
+    # Reference line — ‾/─/_ in empty cells, mapped independently of braille sub-rows.
+    ref_row:  int | None = None
+    ref_char: str        = ""
     if ref_val is not None:
-        ref_dr  = _data_row(ref_val)
-        ref_row = ref_dr // 4
-        ref_ch  = ("─\u0305" if ref_dr % 4 == 0 else
-                   "─\u0332" if ref_dr % 4 == 3 else "─")
+        ref_row, ref_char = _ref_row_and_char(ref_val)
 
     # All bin boundaries in one searchsorted call, then loop over non-empty bins.
     bin_edges  = np.linspace(0.0, x_total, data_w + 1)
@@ -334,7 +518,7 @@ def _build_sparkline_grid(
     bin_counts = hi_indices - lo_indices
     n_nonempty = int(np.count_nonzero(bin_counts))
     mean_count = float(bin_counts.sum()) / max(1, n_nonempty)
-    use_mean_range = x_transform is None and mean_count > _SPARK_DOTS_THRESHOLD
+    use_mean_range = not individual_dots and x_transform is None and mean_count > _SPARK_DOTS_THRESHOLD
 
     for dc in range(data_w):
         lo_idx = int(lo_indices[dc])
@@ -364,7 +548,7 @@ def _build_sparkline_grid(
             elif range_bits[r][c]:
                 grid[r][c] = (chr(0x2800 + range_bits[r][c]), cp_range)
             elif r == ref_row:
-                grid[r][c] = (ref_ch, cp_ref)
+                grid[r][c] = (ref_char, cp_ref)
 
     return grid, y_min, y_max
 
@@ -614,6 +798,10 @@ class SimulationReader(Protocol):
         """(n_replicas,) int: thermodynamic state of each replica at *iteration*."""
         ...
 
+    def replica_states_range(self, start: int, end: int) -> np.ndarray[Any, np.dtype[Any]]:
+        """(end-start, n_replicas) int: thermodynamic states for iterations start..end-1."""
+        ...
+
     def energies(self, iteration: int) -> np.ndarray[Any, np.dtype[Any]]:
         """(n_replicas, n_states) float: reduced potential u_rs = U(x_r) / kT_s."""
         ...
@@ -674,9 +862,48 @@ class SimulationReader(Protocol):
         """
         ...
 
+    def get_title(self) -> str:
+        """A short human-readable label for this trajectory (file name, run ID, …)."""
+        ...
+
+    def parse_topology(self) -> list[tuple[str, list[int]]]:
+        """Return one entry per molecule: (hill_formula, sorted_atom_indices).
+
+        Molecules are ordered by their lowest atom index.  Atom indices are
+        0-based and may be non-contiguous (e.g. after solvent grouping).
+        Raises if the topology cannot be determined from the trajectory file.
+        """
+        ...
+
 
 class OpenmmToolsReader:
     """SimulationReader for openmmtools HREX netCDF4 files."""
+
+    # ── NC-specific private helpers ────────────────────────────────────────
+
+    def _read_thermo_state(self) -> dict[str, Any]:
+        """Parse the first thermodynamic state from the open NC handle."""
+        raw = b"".join(self._nc.groups["thermodynamic_states"].variables["state0"][:]).decode()
+        return yaml.safe_load(raw)
+
+    def _read_mcmc_move(self) -> dict[str, Any]:
+        """Parse MCMC moves from the open NC handle.
+
+        Asserts one identical move per replica and returns the first move's doc.
+        """
+        move_vars  = self._nc.groups["mcmc_moves"].variables
+        n_replicas = self._nc.variables["energies"].shape[1]
+        assert len(move_vars) == n_replicas and all(
+            move_vars[f"move{i}"][0] == move_vars["move0"][0] for i in range(1, n_replicas)
+        ), f"Expected {n_replicas} identical MCMC moves, got: {list(move_vars)}"
+        return yaml.safe_load(str(move_vars["move0"][0]))
+
+    def _system_xml(self) -> str:
+        """Decompress and return the OpenMM System XML embedded in the NC file."""
+        doc = self._read_thermo_state()
+        return zlib.decompress(doc["standard_system"]).decode()
+
+    # ── Construction ───────────────────────────────────────────────────────
 
     def __init__(self, storage: Path) -> None:
         self._storage = Path(storage)
@@ -697,7 +924,9 @@ class OpenmmToolsReader:
         )
         has_ap = len(analysis_particle_indices) > 0
 
-        all_masses, all_constraints, has_cm_remover = _load_masses_from_nc(self._nc)
+        all_masses, all_constraints, has_cm_remover = _parse_masses_from_system_xml(
+            self._system_xml()
+        )
         kinetic_set = (
             set(analysis_particle_indices) if has_ap else set(range(len(all_masses)))
         )
@@ -709,14 +938,14 @@ class OpenmmToolsReader:
         )
         self._n_dof = 3 * n_kp - n_con - (3 if has_cm_remover else 0)
 
-        move_doc = _read_mcmc_move(self._nc)
+        move_doc = self._read_mcmc_move()
         assert "n_steps" in move_doc and "integrator" in move_doc
         integrator_root = ET.fromstring(move_doc["integrator"])
         assert "stepSize" in integrator_root.attrib
         self._timestep_ps   = float(integrator_root.attrib["stepSize"])
         self._steps_per_iter = int(move_doc["n_steps"])
 
-        thermo_doc  = _read_thermo_state(self._nc)
+        thermo_doc  = self._read_thermo_state()
         temp_entry  = thermo_doc["temperature"]
         assert isinstance(temp_entry, dict) and "value" in temp_entry
         self._ref_temp_k = float(temp_entry["value"])
@@ -805,6 +1034,9 @@ class OpenmmToolsReader:
 
     def replica_states(self, iteration: int) -> np.ndarray[Any, np.dtype[Any]]:
         return self._nc.variables["states"][iteration, :].astype(int)  # type: ignore[union-attr]
+
+    def replica_states_range(self, start: int, end: int) -> np.ndarray[Any, np.dtype[Any]]:
+        return self._nc.variables["states"][start:end, :].astype(int)  # type: ignore[union-attr]
 
     def energies(self, iteration: int) -> np.ndarray[Any, np.dtype[Any]]:
         return np.array(self._nc.variables["energies"][iteration, :, :])  # type: ignore[union-attr]
@@ -908,6 +1140,12 @@ class OpenmmToolsReader:
         except (KeyError, OSError, IndexError, RuntimeError):
             return None
 
+    def get_title(self) -> str:
+        return self._storage.name
+
+    def parse_topology(self) -> list[tuple[str, list[int]]]:
+        return _parse_system_topology(self._system_xml())
+
 
 # ── State initialisation and event loop ───────────────────────────────────────
 
@@ -917,6 +1155,7 @@ def _init_state(
     n_iterations_arg: int | None,
     init_atom_sel: list[int] | None,
     interval: float,
+    storage: "Path",
 ) -> types.SimpleNamespace:
     """Build initial mutable state namespace from a SimulationReader."""
     n_replicas   = reader.n_replicas
@@ -925,6 +1164,10 @@ def _init_state(
 
     return types.SimpleNamespace(
         # Derived from reader static properties
+        storage_path=storage,
+        title=reader.get_title(),
+        flash_msg="",
+        flash_until=0.0,
         interval=interval,
         n_replicas=n_replicas,
         n_states=n_states,
@@ -958,6 +1201,10 @@ def _init_state(
         # Position / RMSD state
         solute_atom_sel=init_atom_sel,
         solute_sel_str=(f"0-{init_atom_sel[-1]}" if init_atom_sel is not None else ""),
+        state0_replica_iters=[],      # iteration index for each state-0 replica record
+        state0_replica_vals=[],       # float replica index at each recorded iteration
+        state0_scan_iter=0,           # next iteration to scan for state-0 replica
+        state0_scanning=False,        # True while _state0_scan_gen is running
         pos_frame_iters=[],
         pos_all_frames=[],
         pairwise_rmsd_mat=[],
@@ -968,8 +1215,18 @@ def _init_state(
         medoid_rmsd_cache=[],         # per-frame medoid RMSD (Å); recomputed when frame count changes
         medoid_n_frames_cached=0,     # len(pairwise_rmsd_mat) when medoid_rmsd_cache was last computed
         medoid_computing=False,       # True while _medoid_rmsd_gen task is in the runner
+        cluster_k=None,               # int | None — k chosen by bootstrap stability
+        k_choosing=False,             # True while _stability_choose_k_gen is running
+        k_chosen_n_frames=0,          # n_pos_frames when cluster_k was last chosen
+        cluster_labels=[],               # int cluster index per frame; written atomically by _cluster_gen
+        cluster_medoids=[],              # frame indices of medoids
+        cluster_outlier_mask=[],         # bool per frame: True if dist_to_medoid > mean+N*std
+        cluster_intercluster_dists=[],   # k×k list[list[float]] of inter-medoid distances
+        cluster_n_frames_cached=0,       # n_pos_frames when cluster_labels was last computed
+        cluster_computing=False,         # True while _cluster_gen task is in the runner
         pos_scan_iter=0,      # next iteration index to attempt for RMSD accumulation
-        history_computing=False,  # True while _history_scan_gen task is in the runner
+        history_computing=False,    # True while _history_scan_gen task is in the runner
+        history_bulk_loading=True,  # False after the first history scan completes
         rmsd_computing=False,     # True while _rmsd_gen task is in the runner
         # UI state
         sparkline_mode=0,
@@ -1004,6 +1261,28 @@ def _init_state(
         fe_iters=[],
         fe_vals=[],
     )
+
+
+def _export_medoids_pdb(S: types.SimpleNamespace) -> str:
+    """Write each cluster medoid as a MODEL in a PDB file. Returns output path or ''."""
+    if not S.cluster_medoids or not S.pos_all_frames:
+        return ""
+    out_path = S.storage_path.with_name(S.storage_path.stem + "_medoids.pdb")
+    with open(out_path, "w") as fh:
+        for model_num, med_idx in enumerate(S.cluster_medoids, 1):
+            if med_idx >= len(S.pos_all_frames):
+                continue
+            pos_ang = np.asarray(S.pos_all_frames[med_idx]) * 10.0  # nm → Å
+            fh.write(f"MODEL     {model_num:4d}\n")
+            fh.write(f"REMARK cluster {model_num}  frame {S.pos_frame_iters[med_idx]}\n")
+            for serial, (x, y, z) in enumerate(pos_ang, 1):
+                fh.write(
+                    f"ATOM  {serial:5d}  CA  UNK A{serial:4d}    "
+                    f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00\n"
+                )
+            fh.write("ENDMDL\n")
+        fh.write("END\n")
+    return str(out_path)
 
 
 def _handle_key(key: int, S: types.SimpleNamespace) -> tuple[bool, bool]:
@@ -1063,10 +1342,19 @@ def _handle_key(key: int, S: types.SimpleNamespace) -> tuple[bool, bool]:
                 S.centroid_n_frames_cached  = 0
                 S.medoid_rmsd_cache         = []
                 S.medoid_n_frames_cached    = 0
+                S.cluster_k                  = None
+                S.k_choosing                 = False
+                S.k_chosen_n_frames          = 0
+                S.cluster_labels             = []
+                S.cluster_medoids            = []
+                S.cluster_outlier_mask       = []
+                S.cluster_intercluster_dists = []
+                S.cluster_n_frames_cached    = 0
                 S.pos_scan_iter    = 0
                 S.rmsd_computing     = False  # old tasks invalidated; runner drains naturally
                 S.centroid_computing = False
                 S.medoid_computing   = False
+                S.cluster_computing  = False
                 S.rmsd_sel_error   = ""
                 S.rmsd_input_active = False
                 S.rmsd_input_buf = ""
@@ -1095,6 +1383,23 @@ def _handle_key(key: int, S: types.SimpleNamespace) -> tuple[bool, bool]:
             return True, False
         elif key == ord("?"):
             S.show_spark_help = not S.show_spark_help
+            return True, False
+        elif key == ord("k") and not S.k_choosing and not S.cluster_computing:
+            S.cluster_k                  = None
+            S.k_chosen_n_frames          = 0
+            S.cluster_labels             = []
+            S.cluster_medoids            = []
+            S.cluster_outlier_mask       = []
+            S.cluster_intercluster_dists = []
+            S.cluster_n_frames_cached    = 0
+            return True, False
+        elif key == ord("e") and S.cluster_medoids:
+            path = _export_medoids_pdb(S)
+            if path:
+                S.flash_msg   = f"Medoids written → {path}"
+            else:
+                S.flash_msg   = "No clusters yet — nothing to export"
+            S.flash_until = time.monotonic() + 6.0
             return True, False
         elif key == ord("a") and _SPARK_MODES[S.sparkline_mode].needs_atoms:
             S.rmsd_input_active = True
@@ -1173,7 +1478,7 @@ class TaskRunner:
                 worked = True
                 self._tasks.append(task)   # re-queue for round-robin
             except StopIteration:
-                pass  # task finished normally — not re-queued
+                worked = True  # task finished — final cleanup may have mutated state
         return worked
 
     def __bool__(self) -> bool:
@@ -1213,6 +1518,12 @@ class SparkMode:
     get_grid:    Callable[..., tuple[int, str, str]] | None = field(default=None, repr=False)
     xaxis_m_fn:  Callable[..., str] | None                  = field(default=None, repr=False)
     poll:        Callable[..., None] | None                  = field(default=None, repr=False)
+    # When set, replaces _build_sparkline_grid for 2-D raster displays.
+    # Signature: (S, spark_w, n_rows, total_iters, has_256) -> list[list[(char, attr)]]
+    raster_fn:   Callable[..., list[list[tuple[str, int]]]] | None = field(default=None, repr=False)
+    # Fixed y-axis range, bypassing data-driven scaling. Callable so it can depend on S.
+    # Signature: (S,) -> (y_min, y_max)
+    y_fixed_range: Callable[..., tuple[float, float]] | None = field(default=None, repr=False)
 
 
 # ── get_data helpers ───────────────────────────────────────────────────────────
@@ -1264,6 +1575,17 @@ def _data_medoid_rmsd(S: types.SimpleNamespace, _w: int) -> tuple[list[int], lis
     n = S.medoid_n_frames_cached
     return S.pos_frame_iters[:n], S.medoid_rmsd_cache
 
+_STATE0_DOTS_PER_COL = 5  # target rendered points per terminal column in state 0 replica over time view
+
+def _data_state0_replica(S: types.SimpleNamespace, spark_w: int) -> tuple[list[int], list[float]]:
+    iters = S.state0_replica_iters
+    vals  = S.state0_replica_vals
+    n = len(iters)
+    if n == 0:
+        return [], []
+    stride = max(1, n // (spark_w * _STATE0_DOTS_PER_COL))
+    return iters[::stride], vals[::stride]
+
 
 # ── get_ref helpers ────────────────────────────────────────────────────────────
 
@@ -1310,6 +1632,25 @@ def _grid_acf(
 def _xaxis_m_acf(S: types.SimpleNamespace) -> str:
     return f"{S.n_pos_frames} frames" if S.n_pos_frames else ""
 
+def _data_cluster_occupancy(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
+    k = S.cluster_k
+    if not k or not S.cluster_labels:
+        return [], []
+    n = len(S.cluster_labels)
+    return list(range(k)), [S.cluster_labels.count(c) / n for c in range(k)]
+
+def _grid_cluster_occupancy(
+    S: types.SimpleNamespace, sp_iters: list[int], total_iters: int
+) -> tuple[int, str, str]:
+    k = S.cluster_k or 1
+    return k - 1, "cluster 0", f"cluster {k - 1}"
+
+def _xaxis_m_cluster_occupancy(S: types.SimpleNamespace) -> str:
+    k   = S.cluster_k
+    lab = "choosing k…" if S.k_choosing else (f"k={k}" if k else "")
+    n   = len(S.cluster_labels)
+    return f"{lab}  {n} frames" if n else lab
+
 
 # ── poll helpers ───────────────────────────────────────────────────────────────
 
@@ -1326,6 +1667,342 @@ def _poll_medoid(S: types.SimpleNamespace, runner: TaskRunner) -> None:
             and S.n_pos_frames != S.medoid_n_frames_cached):
         S.medoid_computing = True
         runner.submit(_medoid_rmsd_gen(S))
+
+
+_K_MIN_FRAMES          = 20   # minimum frames before attempting k-selection
+_K_GROWTH_FACTOR       = 1.5  # retrigger k-selection when frame count grows by this factor
+_K_MAX                 = 8    # never try more than this many clusters
+_K_BOOTSTRAP_B         = 20   # bootstrap replicates per candidate k
+_OUTLIER_STD_THRESHOLD = 2.0  # flag frames > mean + N*std distance to medoid as outliers
+
+
+def _mds_1d(dist_mat: np.ndarray) -> np.ndarray:
+    """Embed k points in 1D using classical MDS on a k×k distance matrix.
+
+    Returns k positions (arbitrary scale/sign; caller normalises).  For k≤2
+    the result is exact; for k>2 it uses the leading eigenvector of the
+    double-centred squared-distance matrix.
+    """
+    k = len(dist_mat)
+    if k == 1:
+        return np.zeros(1)
+    if k == 2:
+        return np.array([0.0, float(dist_mat[0, 1])])
+    D2 = np.asarray(dist_mat, dtype=float) ** 2
+    H  = np.eye(k) - np.ones((k, k)) / k
+    B  = -0.5 * H @ D2 @ H
+    eigvals, eigvecs = np.linalg.eigh(B)
+    pos = eigvecs[:, -1] * np.sqrt(max(0.0, float(eigvals[-1])))
+    return pos
+
+
+def _kmedoids(dist_mat: np.ndarray, k: int, n_iter: int = 50) -> np.ndarray:
+    """K-medoids on a precomputed symmetric distance matrix; returns label array."""
+    n = len(dist_mat)
+    # Greedy farthest-point initialisation
+    medoids: list[int] = [0]
+    for _ in range(k - 1):
+        dists = dist_mat[:, medoids].min(axis=1)
+        medoids.append(int(np.argmax(dists)))
+    # PAM-style update
+    labels = np.zeros(n, dtype=int)
+    for _ in range(n_iter):
+        labels = np.argmin(dist_mat[:, medoids], axis=1)
+        new_medoids = list(medoids)
+        changed = False
+        for c in range(k):
+            members = np.where(labels == c)[0]
+            if len(members) == 0:
+                continue
+            costs = dist_mat[np.ix_(members, members)].sum(axis=1)
+            new_med = int(members[np.argmin(costs)])
+            if new_med != new_medoids[c]:
+                changed = True
+            new_medoids[c] = new_med
+        medoids = new_medoids
+        if not changed:
+            break
+    return np.argmin(dist_mat[:, medoids], axis=1)
+
+
+def _adjusted_rand_index(a: np.ndarray, b: np.ndarray) -> float:
+    """Adjusted Rand Index between two label arrays.
+
+    Corrects for chance: expected value is 0 for random labellings, 1 for
+    identical.  Unlike the plain Rand index it does not systematically reward
+    small k, so argmax over k gives an unbiased cluster count.
+    """
+    n = len(a)
+    if n < 2:
+        return 1.0
+    # Contingency table via pair counting (avoids O(n²) boolean matrix)
+    ka = int(a.max()) + 1
+    kb = int(b.max()) + 1
+    contingency = np.zeros((ka, kb), dtype=np.int64)
+    for ai, bi in zip(a, b):
+        contingency[ai, bi] += 1
+    def comb2(x: np.ndarray) -> np.ndarray:
+        return x * (x - 1) // 2
+    sum_comb_c  = int(comb2(contingency).sum())
+    sum_comb_a  = int(comb2(contingency.sum(axis=1)).sum())
+    sum_comb_b  = int(comb2(contingency.sum(axis=0)).sum())
+    total_pairs = n * (n - 1) // 2
+    expected    = sum_comb_a * sum_comb_b / max(1, total_pairs)
+    maximum     = (sum_comb_a + sum_comb_b) / 2.0
+    denom = maximum - expected
+    return (sum_comb_c - expected) / denom if denom > 0 else 1.0
+
+
+def _stability_choose_k_gen(S: types.SimpleNamespace) -> Generator[None, None, None]:
+    """Choose k via bootstrap stability using Adjusted Rand Index.
+
+    ARI corrects for chance (expected value 0 for random labels, 1 for perfect
+    agreement) so it does not systematically favour small k the way the plain
+    Rand index does.  We pick the k with the highest mean ARI across
+    _K_BOOTSTRAP_B subsampled replicates.  Writes S.cluster_k and
+    S.k_chosen_n_frames when done.  Clears S.k_choosing on exit.
+    """
+    try:
+        mat_rows = [list(row) for row in S.pairwise_rmsd_mat]  # snapshot
+        n = len(mat_rows)
+        k_max = min(_K_MAX, n // 5)
+        if k_max < 2:
+            return
+
+        mat = np.zeros((n, n))
+        for i, row in enumerate(mat_rows):
+            mat[i, : len(row)] = row
+            yield
+        mat = mat + mat.T
+
+        sub_size = max(4, int(0.8 * n))
+        stabilities: dict[int, float] = {}
+
+        for k in range(2, k_max + 1):
+            labels_ref = _kmedoids(mat, k)
+            yield
+            scores: list[float] = []
+            for _ in range(_K_BOOTSTRAP_B):
+                idx = np.sort(np.random.choice(n, size=sub_size, replace=False))
+                sub_mat = mat[np.ix_(idx, idx)]
+                labels_sub = _kmedoids(sub_mat, k)
+                scores.append(_adjusted_rand_index(labels_ref[idx], labels_sub))
+                yield
+            stabilities[k] = float(np.mean(scores))
+
+        chosen_k = max(stabilities, key=lambda k: stabilities[k])
+        S.cluster_k         = chosen_k
+        S.k_chosen_n_frames = n
+        _LOG.debug("k-stability (ARI): chose k=%d from %s", chosen_k, stabilities)
+    finally:
+        S.k_choosing = False
+
+
+def _cluster_gen(S: types.SimpleNamespace) -> Generator[None, None, None]:
+    """Assign cluster labels using the current S.cluster_k via k-medoids.
+
+    Snapshots the pairwise matrix at entry, builds the symmetric form (yielding
+    per row), then runs _kmedoids (yielding once after each k-1 farthest-point
+    init step and once per PAM update per cluster).  Writes S.cluster_labels and
+    S.cluster_n_frames_cached atomically at the end.  Clears S.cluster_computing.
+    """
+    try:
+        k = S.cluster_k
+        if k is None:
+            return
+        mat_rows = [list(row) for row in S.pairwise_rmsd_mat]  # snapshot
+        n = len(mat_rows)
+        if n < k:
+            return
+        mat = np.zeros((n, n))
+        for i, row in enumerate(mat_rows):
+            mat[i, : len(row)] = row
+            yield
+        mat = mat + mat.T
+
+        # Greedy farthest-point initialisation
+        medoids: list[int] = [0]
+        for _ in range(k - 1):
+            dists = mat[:, medoids].min(axis=1)
+            medoids.append(int(np.argmax(dists)))
+            yield
+        # PAM update
+        labels = np.zeros(n, dtype=int)
+        for _ in range(50):
+            labels = np.argmin(mat[:, medoids], axis=1)
+            yield
+            new_medoids = list(medoids)
+            changed = False
+            for c in range(k):
+                members = np.where(labels == c)[0]
+                if len(members) == 0:
+                    continue
+                costs = mat[np.ix_(members, members)].sum(axis=1)
+                new_med = int(members[np.argmin(costs)])
+                if new_med != new_medoids[c]:
+                    changed = True
+                new_medoids[c] = new_med
+                yield
+            medoids = new_medoids
+            if not changed:
+                break
+
+        # Per-frame distance to assigned medoid
+        medoid_arr = np.array(medoids)
+        dist_to_med = mat[np.arange(n), medoid_arr[labels]]
+        mean_d, std_d = float(dist_to_med.mean()), float(dist_to_med.std())
+        threshold = mean_d + _OUTLIER_STD_THRESHOLD * std_d
+        outlier_mask = (dist_to_med > threshold).tolist()
+
+        # k×k inter-medoid distance matrix
+        intercluster = mat[np.ix_(medoids, medoids)]
+
+        S.cluster_labels            = labels.tolist()
+        S.cluster_medoids           = list(medoids)
+        S.cluster_outlier_mask      = outlier_mask
+        S.cluster_intercluster_dists = intercluster.tolist()
+        S.cluster_n_frames_cached   = n
+    finally:
+        S.cluster_computing = False
+
+
+def _poll_cluster(S: types.SimpleNamespace, runner: TaskRunner) -> None:
+    n = S.n_pos_frames
+    if n < _K_MIN_FRAMES:
+        return
+    # Trigger k-selection when we have no k yet or frames have grown significantly.
+    # Don't start a new k-selection while a previous one (or label assignment) is running.
+    needs_new_k = S.cluster_k is None or n >= S.k_chosen_n_frames * _K_GROWTH_FACTOR
+    if needs_new_k and not S.k_choosing and not S.cluster_computing:
+        S.k_choosing = True
+        runner.submit(_stability_choose_k_gen(S))
+        return  # wait for k to settle before assigning labels
+    # Assign labels whenever frame count changes and k is stable
+    if (S.cluster_k is not None
+            and not S.cluster_computing
+            and not S.k_choosing
+            and n != S.cluster_n_frames_cached):
+        S.cluster_computing = True
+        runner.submit(_cluster_gen(S))
+
+
+def _raster_state0_replica(
+    S: types.SimpleNamespace, spark_w: int, n_rows: int, total_iters: int, has_256: bool
+) -> list[list[tuple[str, int]]]:
+    """Scatter plot: x=time, y=physical replica occupying state 0, colour=green."""
+    grid: list[list[tuple[str, int]]] = [[(" ", 0)] * spark_w for _ in range(n_rows)]
+    if total_iters == 0 or not S.pos_frame_replicas:
+        return grid
+    attr = curses.color_pair(_CP_GREEN)
+    for frame_iter, replica in zip(S.pos_frame_iters, S.pos_frame_replicas):
+        col = min(spark_w - 1, int(frame_iter / total_iters * spark_w))
+        if 0 <= replica < n_rows:
+            grid[replica][col] = ("█", attr)
+    return grid
+
+
+def _bar_cluster_occupancy(
+    S: types.SimpleNamespace, spark_w: int, n_rows: int, total_iters: int, has_256: bool
+) -> list[list[tuple[str, int]]]:
+    """Bar chart: x=cluster (+outlier), bar height=fraction of state-0 frames."""
+    grid: list[list[tuple[str, int]]] = [[(" ", 0)] * spark_w for _ in range(n_rows)]
+    k = S.cluster_k
+    if not k or not S.cluster_labels:
+        return grid
+    labels       = S.cluster_labels
+    outlier_mask = S.cluster_outlier_mask
+    total        = len(labels)
+    n_outliers   = sum(outlier_mask) if outlier_mask else 0
+    # One bar per cluster, plus a grey outlier bar if any exist
+    bars: list[tuple[int, int]] = [
+        (sum(1 for i, l in enumerate(labels) if l == c and not (outlier_mask and outlier_mask[i])),
+         _raster_color_attr(c, has_256))
+        for c in range(k)
+    ]
+    if n_outliers:
+        bars.append((n_outliers, curses.color_pair(_CP_GREY) | curses.A_DIM))
+    n_bars = len(bars)
+    for b, (count, attr) in enumerate(bars):
+        col_lo = b * spark_w // n_bars
+        col_hi = (b + 1) * spark_w // n_bars
+        if col_lo >= col_hi:
+            continue
+        bar_height = count / total * n_rows
+        full_rows  = int(bar_height)
+        partial    = bar_height - full_rows
+        for col in range(col_lo, col_hi):
+            for row_from_bot in range(full_rows):
+                grid[n_rows - 1 - row_from_bot][col] = ("█", attr)
+            if partial > 0 and full_rows < n_rows:
+                grid[n_rows - 1 - full_rows][col] = (_BAR_CHARS[max(1, round(partial * 8))], attr)
+    return grid
+
+
+def _raster_cluster_trajectory(
+    S: types.SimpleNamespace, spark_w: int, n_rows: int, total_iters: int, has_256: bool
+) -> list[list[tuple[str, int]]]:
+    """Braille scatter: x=time, y=1D-MDS cluster position, colour=cluster (grey=outlier).
+
+    Outlier frames are positioned via softmin-weighted average of cluster MDS
+    positions using their distances to each medoid, so they appear between the
+    clusters they are structurally intermediate to rather than at an arbitrary row.
+    """
+    grid: list[list[tuple[str, int]]] = [[(" ", 0)] * spark_w for _ in range(n_rows)]
+    k = S.cluster_k
+    if not k or not S.cluster_labels or total_iters == 0:
+        return grid
+    dists = S.cluster_intercluster_dists
+    if not dists:
+        return grid
+
+    pos = _mds_1d(np.array(dists))
+    pos_min, pos_max = float(pos.min()), float(pos.max())
+    norm = (pos - pos_min) / (pos_max - pos_min) if pos_max > pos_min else np.full(k, 0.5)
+
+    outlier_mask = S.cluster_outlier_mask
+    medoids      = S.cluster_medoids
+    mat_rows     = S.pairwise_rmsd_mat
+    grey_attr    = curses.color_pair(_CP_GREY) | curses.A_DIM
+
+    # Braille sub-cell resolution: 2 sub-cols × 4 sub-rows per terminal cell
+    data_h = n_rows * 4
+    data_w = spark_w * 2
+    bits_grid: list[list[int]] = [[0] * spark_w for _ in range(n_rows)]
+    attr_grid: list[list[int]] = [[0] * spark_w for _ in range(n_rows)]
+
+    for i, (frame_iter, cluster) in enumerate(zip(S.pos_frame_iters, S.cluster_labels)):
+        is_outlier = bool(outlier_mask[i]) if outlier_mask else False
+
+        if is_outlier and medoids:
+            # mat_rows is lower-triangular: dist(a,b) = mat_rows[max(a,b)][min(a,b)]
+            dists_to_meds = np.array([
+                0.0 if i == m else (float(mat_rows[i][m]) if m < i else float(mat_rows[m][i]))
+                for m in medoids
+            ])
+            scale = float(dists_to_meds.mean()) or 1.0
+            weights = np.exp(-dists_to_meds / scale)
+            weights /= weights.sum()
+            y_frac = float((weights * norm).sum())
+        else:
+            y_frac = float(norm[cluster])
+
+        # High y_frac → top (row 0); low → bottom
+        dc = min(data_w - 1, int(frame_iter / total_iters * data_w))
+        dr = int(round((1.0 - y_frac) * (data_h - 1)))
+        dr = max(0, min(data_h - 1, dr))
+        tr, tc = dr // 4, dc // 2
+        bits_grid[tr][tc] |= _BRAILLE_BITS[dc % 2][dr % 4]
+
+        attr = grey_attr if is_outlier else _raster_color_attr(cluster, has_256)
+        if attr_grid[tr][tc] == 0 or attr_grid[tr][tc] == grey_attr:
+            attr_grid[tr][tc] = attr
+
+    for r in range(n_rows):
+        for c in range(spark_w):
+            b = bits_grid[r][c]
+            if b:
+                grid[r][c] = (chr(0x2800 + b), attr_grid[r][c])
+    return grid
 
 
 # ── Mode registry ──────────────────────────────────────────────────────────────
@@ -1457,6 +2134,50 @@ _SPARK_MODES: list[SparkMode] = [
         get_data=_data_acf, get_ref=_ref_acf_plateau,
         needs_atoms=True, individual_dots=True, x_transform=math.log10,
         get_grid=_grid_acf, xaxis_m_fn=_xaxis_m_acf,
+    ),
+    SparkMode(
+        name="replica over time", unit="",
+        help_text=(
+            "Which physical replica is occupying thermodynamic state 0 at each sampled "
+            "frame (braille scatter, individual dots).  X-axis is simulation time; "
+            "Y-axis is physical replica index.  Good REMD mixing produces a scatter "
+            "spread across all replica indices over time.  A single index dominating "
+            "long stretches indicates a replica is stuck at state 0."
+        ),
+        get_data=_data_state0_replica,
+        get_ref=lambda *_: None,
+        individual_dots=True,
+        y_fixed_range=lambda S: (-0.5, S.n_replicas - 0.5),
+    ),
+    SparkMode(
+        name="cluster occupancy", unit="",
+        help_text=(
+            "Fraction of state-0 frames in each conformational cluster (k-medoids on "
+            "pairwise RMSD).  Each bar is one cluster; bar height is the fraction of "
+            "frames assigned to it.  Unequal bars indicate metastability.  k is chosen "
+            "by bootstrap stability using Adjusted Rand Index (corrected for chance, so "
+            "it does not systematically favour small k): for each candidate k, 20 "
+            "subsampled replicates are clustered and their ARI vs the reference is "
+            "averaged; the k with the highest mean ARI wins.  k is recomputed when "
+            "frame count grows by _K_GROWTH_FACTOR; press 'k' to force a recompute."
+        ),
+        get_data=lambda S, _: ([], []), get_ref=lambda *_: None,
+        needs_atoms=True, raster_fn=_bar_cluster_occupancy, poll=_poll_cluster,
+    ),
+    SparkMode(
+        name="cluster trajectory", unit="",
+        help_text=(
+            "Which conformational cluster state-0 occupies at each sampled frame "
+            "(x=time, y=cluster, colour=cluster, grey=outlier).  Clusters are "
+            "positioned on the y-axis by 1D MDS of the inter-medoid RMSD matrix, "
+            "so vertical spacing reflects structural distance between basins.  "
+            "Grey dots are outliers: frames whose RMSD to their assigned medoid "
+            f"exceeds the within-cluster mean + {_OUTLIER_STD_THRESHOLD:.0f}σ.  "
+            "Persistent occupation of one cluster with rare transitions indicates "
+            "metastability; rapid switching indicates good conformational sampling."
+        ),
+        get_data=lambda S, _: ([], []), get_ref=lambda *_: None,
+        needs_atoms=True, raster_fn=_raster_cluster_trajectory, poll=_poll_cluster,
     ),
 ]
 
@@ -1593,6 +2314,7 @@ def _history_scan_gen(
             S.last_mixed_iter + 1, n_chunks, n_tkin_reads, elapsed,
         )
         S.history_computing = False
+        S.history_bulk_loading = False
 
 
 def _rmsd_gen(
@@ -1631,6 +2353,34 @@ def _rmsd_gen(
             yield
     finally:
         S.rmsd_computing = False
+
+
+def _state0_scan_gen(
+    reader: SimulationReader,
+    S: types.SimpleNamespace,
+) -> Generator[None, None, None]:
+    """Bulk-read replica_states for all unseen iterations in one NetCDF slice.
+
+    Reading states[:, :] as a single 2-D array is orders of magnitude faster
+    than one replica_states() call per iteration.  Yields after the read and
+    after the numpy extraction so the render loop stays live.  Clears
+    S.state0_scanning on exit.
+    """
+    try:
+        start = S.state0_scan_iter
+        end   = S.display_iter + 1
+        if start >= end:
+            return
+        states = reader.replica_states_range(start, end)   # (n_iters, n_replicas)
+        yield
+        # For each iteration, argmax on the boolean mask gives the replica in state 0.
+        replica_at_state0 = (states == 0).argmax(axis=1)   # (n_iters,)
+        S.state0_replica_iters.extend(range(start, end))
+        S.state0_replica_vals.extend(replica_at_state0.tolist())
+        S.state0_scan_iter = end
+        yield
+    finally:
+        S.state0_scanning = False
 
 
 
@@ -1817,9 +2567,81 @@ def _poll(reader: SimulationReader, S: types.SimpleNamespace, stdscr: curses.win
     return True
 
 
+def _render_topology(stdscr: curses.window, S: types.SimpleNamespace) -> None:
+    """Render the topology molecule table in place of the exchange matrix.
+
+    Spills into a second (or third…) column when the row count would exceed the
+    available terminal height, up to as many columns as the terminal width allows.
+    """
+    from itertools import groupby
+
+    mols: list[tuple[str, list[int]]] = getattr(S, "topology_molecules", [])
+    n_total = sum(len(m[1]) for m in mols)
+
+    _addstr(stdscr, f"  Topology  {n_total:,} atoms  (0-indexed, copy ranges verbatim)\n\n")
+
+    if not mols:
+        _addstr(stdscr, "    (not yet loaded)\n")
+        return
+
+    # Build all rows up-front so column widths can be computed globally.
+    rows: list[tuple[str, str, int, str]] = []  # (range_str, formula, count, note)
+    for formula, group in groupby(mols, key=lambda m: m[0]):
+        group       = list(group)
+        n           = len(group)
+        all_indices = sorted(idx for _, mol in group for idx in mol)
+        atoms_each  = len(group[0][1])
+        note        = f"({atoms_each} atoms)" if n == 1 else f"({atoms_each} atoms each)"
+        rows.append((_format_index_ranges(all_indices), formula, n, note))
+
+    range_w   = max(len(r[0]) for r in rows)
+    formula_w = max(len(r[1]) for r in rows)
+    count_w   = max(len(str(r[2])) for r in rows)
+    note_w    = max(len(r[3]) for r in rows)
+
+    # Full width of one rendered column (including the leading "    " prefix).
+    # "    " + range + "   " + formula + " × " + count + "  " + note
+    cell_w  = 4 + range_w + 3 + formula_w + 3 + count_w + 2 + note_w
+    col_sep = 4  # spaces between columns
+
+    # Rows available for data: terminal height minus the fixed overhead above
+    # (2 lines for the iteration header + 2 for the topology header) and below
+    # (1 trailing blank + 1 for the input bar drawn at the last row).
+    _term_rows, _term_cols = stdscr.getmaxyx()
+    avail_rows = max(1, _term_rows - 6)
+
+    # Minimum columns needed to fit within avail_rows; cap at what the terminal
+    # width can accommodate.
+    n_cols = math.ceil(len(rows) / avail_rows) if len(rows) > avail_rows else 1
+    while n_cols > 1 and n_cols * cell_w + (n_cols - 1) * col_sep > _term_cols:
+        n_cols -= 1
+    n_cols = max(1, n_cols)
+
+    rows_per_col = math.ceil(len(rows) / n_cols)
+    columns      = [rows[i : i + rows_per_col] for i in range(0, len(rows), rows_per_col)]
+
+    for row_idx in range(rows_per_col):
+        for col_idx, col_rows in enumerate(columns):
+            if col_idx > 0:
+                _addstr(stdscr, " " * col_sep)
+            if row_idx < len(col_rows):
+                range_str, formula, count, note = col_rows[row_idx]
+                _addstr(stdscr, f"    {range_str:>{range_w}}   ", curses.A_BOLD)
+                # Pad note on all but the last column so subsequent columns align.
+                note_str = f"{note:<{note_w}}" if col_idx < len(columns) - 1 else note
+                _addstr(stdscr, f"{formula:<{formula_w}} × {count:>{count_w}}  {note_str}")
+            elif col_idx < len(columns) - 1:
+                _addstr(stdscr, " " * cell_w)  # blank cell to keep later columns aligned
+        _addstr(stdscr, "\n")
+
+    _addstr(stdscr, "\n")
+
+
 def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int] | None) -> None:
     """Redraw the entire screen from S. Pure display, no nc access."""
     stdscr.erase()
+
+    _addstr(stdscr, f"{S.title}\n", curses.A_BOLD)
 
     if S.error_text:
         _addstr(stdscr, f"Unexpected error:\n{S.error_text}")
@@ -1830,7 +2652,7 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
         wall     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         spin_ch  = _SPINNER[int(time.monotonic() * 4) % len(_SPINNER)]
-        _addstr(stdscr, f"Wall: {wall}\n\n")
+        _addstr(stdscr, f"  Wall: {wall}\n\n")
         if not S.ever_polled:
             _addstr(stdscr, f"  {spin_ch}  Reading...", curses.color_pair(_CP_YELLOW))
         else:
@@ -1881,7 +2703,39 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
     else:
         _iter_str = S.iter_str
         _sim_str  = S.sim_str
-    _addstr(stdscr, f"Iteration: {_iter_str}    Time: {_sim_str}{S.timing_str}\n\n")
+    _addstr(stdscr, f"  Iteration: {_iter_str}    Time: {_sim_str}{S.timing_str}\n\n")
+
+    if S.rmsd_input_active:
+        _render_topology(stdscr, S)
+        # Draw input bar at the last row and refresh, then skip the matrix body.
+        _term_rows, _term_cols = stdscr.getmaxyx()
+        _hints     = "   Enter confirm   Esc cancel"
+        _prefix    = "  Atom selection: "
+        _input_str = S.rmsd_input_buf + "\u2588"
+        _err_str   = f"  ✗ {S.rmsd_sel_error}" if S.rmsd_sel_error else ""
+        _lhs       = _prefix + _input_str
+        _mid       = ("  e.g. 0-64,67,200-300" if not S.rmsd_sel_error else "")
+        _rhs       = _mid + _err_str + _hints
+        gap        = max(1, _term_cols - 1 - len(_lhs) - len(_rhs))
+        bar        = (_lhs + " " * gap + _rhs).ljust(_term_cols - 1)
+        try:
+            stdscr.move(_term_rows - 1, 0)
+            stdscr.addstr(bar, curses.A_REVERSE)
+        except curses.error:
+            pass
+        if S.rmsd_sel_error:
+            _err_attr = curses.color_pair(_CP_RED) | curses.A_BOLD | curses.A_REVERSE
+            try:
+                stdscr.move(_term_rows - 1, len(_prefix))
+                stdscr.addstr(_input_str[:max(0, _term_cols - 1 - len(_prefix))], _err_attr)
+                _err_col = len(bar) - len(_hints) - len(_err_str)
+                if 0 <= _err_col < _term_cols - 1:
+                    stdscr.move(_term_rows - 1, _err_col)
+                    stdscr.addstr(_err_str[:max(0, _term_cols - 1 - _err_col)], _err_attr)
+            except curses.error:
+                pass
+        stdscr.refresh()
+        return
 
     col_w    = 7
     matrix_w = 2 + 5 + n_states * col_w
@@ -1911,66 +2765,108 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
     # bins (dots that actually get drawn), not total possible positions — dots
     # with no data are never shown so they shouldn't count in the denominator.
     n_per_unit: float | None = None
-    if not m.individual_dots and spark_w > 0 and sp_vals and grid_total > 0:
-        _use_braille = len(sp_vals) >= spark_w
-        _n_bins = 2 * spark_w if _use_braille else spark_w
-        _filled = len({min(int(it / grid_total * _n_bins), _n_bins - 1) for it in sp_iters})
-        if _filled > 0:
-            n_per_unit = len(sp_vals) / _filled
-
-    if m.xaxis_m_fn is not None:
-        xaxis_m = m.xaxis_m_fn(S)
-    elif n_per_unit is not None and n_per_unit > _SPARK_DOTS_THRESHOLD:
-        xaxis_m = f"~{_fmt_2sf(n_per_unit)}/dot"
-    else:
-        xaxis_m = ""
-
-    spark_grid, spark_ymin, spark_ymax = _build_sparkline_grid(
-        sp_iters, sp_vals,
-        grid_total, n_states, spark_w,
-        cp_mean=curses.color_pair(_CP_GREEN),
-        cp_range=curses.color_pair(_CP_GREY),
-        cp_ref=curses.color_pair(_CP_DIM),
-        ref_val=sp_ref_val,
-        x_transform=m.x_transform,
-        individual_dots=m.individual_dots,
-    )
-
-    # Scrub cursor: blue vertical bar only on empty cells (never overwrites data)
-    if _scrubbing and not m.individual_dots and grid_total > 0:
-        cur_col  = max(0, min(spark_w - 1, int(S.scrub_iter / grid_total * spark_w)))
-        cur_attr = curses.color_pair(_CP_BLUE)
-        for r in range(n_states):
-            if spark_grid[r][cur_col][0] == " ":
-                spark_grid[r][cur_col] = ("│", cur_attr)
+    xaxis_m = ""
+    if m.raster_fn is None:
+        if not m.individual_dots and spark_w > 0 and sp_vals and grid_total > 0:
+            _use_braille = len(sp_vals) >= spark_w
+            _n_bins = 2 * spark_w if _use_braille else spark_w
+            _filled = len({min(int(it / grid_total * _n_bins), _n_bins - 1) for it in sp_iters})
+            if _filled > 0:
+                n_per_unit = len(sp_vals) / _filled
+        if m.xaxis_m_fn is not None:
+            xaxis_m = m.xaxis_m_fn(S)
+        elif n_per_unit is not None and n_per_unit > _SPARK_DOTS_THRESHOLD:
+            xaxis_m = f"~{_fmt_2sf(n_per_unit)}/dot"
 
     sp_prefix = (f"State 0\u2192{n_states-1} {m.name}" if m.multistate
                  else f"State 0 {m.name}")
 
-    if m.needs_atoms and S.solute_atom_sel is None:
-        spark_title = f"{sp_prefix}  (press 'a' to set atom selection)"
-    elif m.needs_atoms:
-        n_frames_total = display_iter // S.pos_interval + 1
-        if S.n_pos_frames < n_frames_total:
-            pct = S.n_pos_frames / n_frames_total * 100
+    if m.raster_fn is not None:
+        has_256 = gradient is not None
+        spark_grid = m.raster_fn(S, spark_w, n_states, total_iters, has_256)
+        spark_ymin = spark_ymax = float("nan")  # unused for raster
+        if m.needs_atoms and S.solute_atom_sel is None:
+            spark_title = f"{sp_prefix}  (press 'a' to set atom selection)"
+        elif m.poll is None:
+            # No background computation — replica scatter just shows what we have
             spark_title = (
-                f"{sp_prefix}  (computing... {pct:.0f}%"
-                f"  {S.n_pos_frames}/{n_frames_total} frames)"
+                f"{sp_prefix}  {S.n_pos_frames} frames"
+                if S.pos_frame_replicas else f"{sp_prefix}  (accumulating...)"
             )
+        elif S.k_choosing:
+            spark_title = f"{sp_prefix}  (choosing k…  {S.n_pos_frames} frames)"
+        elif S.cluster_computing:
+            spark_title = f"{sp_prefix}  k={S.cluster_k}  (clustering…)"
+        elif S.cluster_labels:
+            n_outliers = sum(S.cluster_outlier_mask) if S.cluster_outlier_mask else 0
+            outlier_str = f"  {n_outliers} outliers" if n_outliers else ""
+            if S.cluster_intercluster_dists and S.cluster_k and S.cluster_k > 1:
+                mat = np.array(S.cluster_intercluster_dists)
+                upper = mat[np.triu_indices(S.cluster_k, k=1)]
+                d_min, d_max = float(upper.min()), float(upper.max())
+                dist_str = f"  d={d_min:.1f}–{d_max:.1f}Å"
+            else:
+                dist_str = ""
+            spark_title = (
+                f"{sp_prefix}  k={S.cluster_k}{dist_str}"
+                f"  {len(S.cluster_labels)} frames{outlier_str}"
+            )
+        elif S.n_pos_frames < _K_MIN_FRAMES:
+            spark_title = f"{sp_prefix}  (need {_K_MIN_FRAMES} frames, have {S.n_pos_frames})"
+        else:
+            spark_title = f"{sp_prefix}  (accumulating...)"
+        # Scrub cursor on raster — same logic as sparkline
+        if _scrubbing and grid_total > 0:
+            cur_col  = max(0, min(spark_w - 1, int(S.scrub_iter / grid_total * spark_w)))
+            cur_attr = curses.color_pair(_CP_BLUE)
+            for r in range(n_states):
+                if spark_grid[r][cur_col][0] == " ":
+                    spark_grid[r][cur_col] = ("│", cur_attr)
+    else:
+        _yfix = m.y_fixed_range(S) if m.y_fixed_range is not None else (None, None)
+        spark_grid, spark_ymin, spark_ymax = _build_sparkline_grid(
+            sp_iters, sp_vals,
+            grid_total, n_states, spark_w,
+            cp_mean=curses.color_pair(_CP_GREEN),
+            cp_range=curses.color_pair(_CP_GREY),
+            cp_ref=curses.color_pair(_CP_DIM),
+            ref_val=sp_ref_val,
+            x_transform=m.x_transform,
+            individual_dots=m.individual_dots,
+            y_min_fixed=_yfix[0],
+            y_max_fixed=_yfix[1],
+        )
+        # Scrub cursor: blue vertical bar only on empty cells (never overwrites data)
+        if _scrubbing and not m.individual_dots and grid_total > 0:
+            cur_col  = max(0, min(spark_w - 1, int(S.scrub_iter / grid_total * spark_w)))
+            cur_attr = curses.color_pair(_CP_BLUE)
+            for r in range(n_states):
+                if spark_grid[r][cur_col][0] == " ":
+                    spark_grid[r][cur_col] = ("│", cur_attr)
+        if m.needs_atoms and S.solute_atom_sel is None:
+            spark_title = f"{sp_prefix}  (press 'a' to set atom selection)"
+        elif m.needs_atoms:
+            n_frames_total = display_iter // S.pos_interval + 1
+            if S.n_pos_frames < n_frames_total:
+                pct = S.n_pos_frames / n_frames_total * 100
+                spark_title = (
+                    f"{sp_prefix}  (computing... {pct:.0f}%"
+                    f"  {S.n_pos_frames}/{n_frames_total} frames)"
+                )
+            elif sp_vals:
+                spark_title = f"{sp_prefix}  [{spark_ymin:.4g}, {spark_ymax:.4g}] {m.unit}"
+            else:
+                spark_title = f"{sp_prefix}  (accumulating...)"
+        elif S.history_computing and m.uses_history and S.history_bulk_loading:
+            pct = (S.last_mixed_iter + 1) / (display_iter + 1) * 100
+            spark_title = f"{sp_prefix}  (loading history... {pct:.0f}%)"
         elif sp_vals:
             spark_title = f"{sp_prefix}  [{spark_ymin:.4g}, {spark_ymax:.4g}] {m.unit}"
         else:
             spark_title = f"{sp_prefix}  (accumulating...)"
-    elif S.history_computing and m.uses_history:
-        pct = (S.last_mixed_iter + 1) / (display_iter + 1) * 100
-        spark_title = f"{sp_prefix}  (loading history... {pct:.0f}%)"
-    elif sp_vals:
-        spark_title = f"{sp_prefix}  [{spark_ymin:.4g}, {spark_ymax:.4g}] {m.unit}"
-    else:
-        spark_title = f"{sp_prefix}  (accumulating...)"
 
     # Title row
-    matrix_hdr = "Exchange acceptance (%):"
+    matrix_hdr = "  Exchange acceptance (%):"
     _addstr(stdscr, matrix_hdr, curses.A_BOLD)
     _addstr(stdscr, " " * (matrix_w - len(matrix_hdr)) + sep)
     _title_lines = textwrap.wrap(spark_title, width=spark_w) or [""]
@@ -2196,9 +3092,9 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
         _z_label = "z Live" if _scrubbing else "z Freeze"
         if m.needs_atoms:
             sel_hint = f" ({S.solute_sel_str})" if S.solute_sel_str else ""
-            bar = f"  q Quit   s/S Sparkline   ? Explain   a Atoms{sel_hint}   w/e ±1   W/E ±5%   j Jump   {_z_label}"
+            bar = f"  q Quit   s/S Sparkline   ? Explain   a Atoms{sel_hint}   k Re-cluster   w/e ±1   W/E ±5%   j Jump   {_z_label}"
         else:
-            bar = f"  q Quit   s/S Sparkline   ? Explain   w/e ±1   W/E ±5%   j Jump   {_z_label}"
+            bar = f"  q Quit   s/S Sparkline   ? Explain   k Re-cluster   w/e ±1   W/E ±5%   j Jump   {_z_label}"
     bar = bar.ljust(_term_cols - 1)
     try:
         stdscr.move(_term_rows - 1, 0)
@@ -2257,12 +3153,13 @@ def main(
             time.sleep(interval)
     init_sel = list(range(solute_n_atoms)) if solute_n_atoms is not None else None
     os.environ.setdefault("ESCDELAY", "25")  # reduce ESC recognition delay (default 1000ms)
-    curses.wrapper(lambda stdscr: _main(stdscr, reader, interval, n_iterations, init_sel, no_colorblind_mode))
+    curses.wrapper(lambda stdscr: _main(stdscr, reader, storage, interval, n_iterations, init_sel, no_colorblind_mode))
 
 
 def _main(
     stdscr: curses.window,
     reader: SimulationReader,
+    storage: "Path",
     interval: float,
     n_iterations_arg: int | None,
     init_atom_sel: list[int] | None,
@@ -2281,8 +3178,15 @@ def _main(
     curses.init_pair(_CP_DIM,          curses.COLOR_YELLOW, -1)
     _key_points = _GRADIENT_KEY_POINTS_CLASSIC if no_colorblind_mode else _GRADIENT_KEY_POINTS
     gradient = _init_gradient_pairs(_key_points) if curses.COLORS >= 256 else None
+    if curses.COLORS >= 256:
+        _init_raster_pairs()
 
-    S      = _init_state(reader, n_iterations_arg, init_atom_sel, interval)
+    S      = _init_state(reader, n_iterations_arg, init_atom_sel, interval, storage)
+    try:
+        S.topology_molecules = reader.parse_topology()
+    except Exception:
+        _LOG.warning("failed to parse system topology", exc_info=True)
+        S.topology_molecules = []
     runner = TaskRunner()
 
     last_poll    = -1e9   # force immediate first poll
@@ -2351,6 +3255,10 @@ def _main(
         ):
             S.history_computing = True
             runner.submit(_history_scan_gen(reader, S))
+
+        if not S.state0_scanning and not S.waiting and S.state0_scan_iter <= S.display_iter:
+            S.state0_scanning = True
+            runner.submit(_state0_scan_gen(reader, S))
 
         if (
             not S.rmsd_computing
