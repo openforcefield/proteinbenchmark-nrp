@@ -1239,6 +1239,8 @@ def _init_state(
         scrub_dirty=False,        # True when scrub_iter changed and data not yet read
         scrub_states=None,        # replica_states at scrub_iter
         scrub_energies=None,      # energies at scrub_iter
+        scrub_acc_sum=None,       # (n_states, n_states) accepted counts up to scrub_iter
+        scrub_prop_sum=None,      # (n_states, n_states) proposed counts up to scrub_iter
         scrub_state_counts=None,  # (n_replicas, n_states) counts up to scrub_iter
         scrub_half_trips=None,    # (n_replicas,) half-trips up to scrub_iter
         scrub_t_kin=None,         # per-replica T_kin strings at scrub_iter
@@ -2297,6 +2299,8 @@ def _history_scan_gen(
                     S.state_counts.copy(),
                     S.half_trips.copy(),
                     list(S.last_extreme),
+                    S.acc_sum.copy(),
+                    S.prop_sum.copy(),
                 ))
                 n_chunks += 1
                 _LOG.debug(
@@ -2402,18 +2406,25 @@ def _fetch_scrub_data(reader: SimulationReader, S: types.SimpleNamespace) -> Non
         idx = -1
 
     if idx >= 0:
-        _, state_counts, half_trips_arr, last_extreme = checkpoints[idx]
+        _, state_counts, half_trips_arr, last_extreme, acc_sum, prop_sum = checkpoints[idx]
         state_counts = state_counts.copy()
         half_trips   = list(half_trips_arr)
         last_extreme = list(last_extreme)
+        acc_sum      = acc_sum.copy()
+        prop_sum     = prop_sum.copy()
         read_from    = checkpoints[idx][0] + 1
     else:
         state_counts = np.zeros((n_replicas, n_states), dtype=int)
         half_trips   = [0] * n_replicas
         last_extreme = [None] * n_replicas
+        acc_sum      = np.zeros((n_states, n_states))
+        prop_sum     = np.zeros((n_states, n_states))
         read_from    = 0
 
     if read_from <= si:
+        acc_delta, prop_delta = reader.exchange_counts(slice(read_from, si + 1))
+        acc_sum  += acc_delta
+        prop_sum += prop_delta
         residual    = reader.states_range(slice(read_from, si + 1))
         n_states_m1 = n_states - 1
         for r in range(n_replicas):
@@ -2426,6 +2437,8 @@ def _fetch_scrub_data(reader: SimulationReader, S: types.SimpleNamespace) -> Non
                          if last_extreme[r] is not None else ext_s)
                 half_trips[r] += int(np.count_nonzero(np.diff(chain)))
 
+    S.scrub_acc_sum      = acc_sum
+    S.scrub_prop_sum     = prop_sum
     S.scrub_state_counts = state_counts
     S.scrub_half_trips   = np.array(half_trips, dtype=int)
 
@@ -2865,14 +2878,16 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
         else:
             spark_title = f"{sp_prefix}  (accumulating...)"
 
-    # Title row
+    # Title rows — spark title wraps freely on the right; the matrix header is
+    # pinned to the last title line so it always sits directly above the column
+    # headers regardless of how many lines the title takes.
     matrix_hdr = "  Exchange acceptance (%):"
+    _title_lines = textwrap.wrap(spark_title, width=spark_w) or [""]
+    for _tl in _title_lines[:-1]:
+        _addstr(stdscr, " " * matrix_w + sep + _tl + "\n", curses.A_BOLD)
     _addstr(stdscr, matrix_hdr, curses.A_BOLD)
     _addstr(stdscr, " " * (matrix_w - len(matrix_hdr)) + sep)
-    _title_lines = textwrap.wrap(spark_title, width=spark_w) or [""]
-    _addstr(stdscr, _title_lines[0] + "\n", curses.A_BOLD)
-    for _tl in _title_lines[1:]:
-        _addstr(stdscr, " " * (matrix_w + len(sep)) + _tl + "\n", curses.A_BOLD)
+    _addstr(stdscr, _title_lines[-1] + "\n", curses.A_BOLD)
 
     # Column header + x-axis (left label | dim centre annotation | right label)
     _addstr(stdscr, f"  {'':>5}" + "".join(f"{i:>{col_w}}" for i in range(n_states)))
@@ -2890,14 +2905,16 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
     _addstr(stdscr, xaxis_r + "\n")
 
     # Data rows + sparkline rows (interleaved by state index)
+    _render_acc  = S.scrub_acc_sum  if _scrubbing else S.acc_sum
+    _render_prop = S.scrub_prop_sum if _scrubbing else S.prop_sum
     for i in range(n_states):
         _addstr(stdscr, f"  {i:>5}")
         for j in range(n_states):
             if i == j:
                 _addstr(stdscr, " " * col_w)
             else:
-                prop = S.prop_sum[i, j]
-                rate = S.acc_sum[i, j] / prop * 100 if prop > 0 else float("nan")
+                prop = _render_prop[i, j]
+                rate = _render_acc[i, j] / prop * 100 if prop > 0 else float("nan")
                 text = f"{'nan':>7}" if math.isnan(rate) else f"{rate:>7.1f}"
                 _addstr(stdscr, text, curses.color_pair(_rate_colour_pair(rate, gradient)))
         _addstr(stdscr, sep)
@@ -3153,7 +3170,17 @@ def main(
             time.sleep(interval)
     init_sel = list(range(solute_n_atoms)) if solute_n_atoms is not None else None
     os.environ.setdefault("ESCDELAY", "25")  # reduce ESC recognition delay (default 1000ms)
-    curses.wrapper(lambda stdscr: _main(stdscr, reader, storage, interval, n_iterations, init_sel, no_colorblind_mode))
+    _curses_main = lambda stdscr: _main(stdscr, reader, storage, interval, n_iterations, init_sel, no_colorblind_mode)
+    try:
+        curses.wrapper(_curses_main)
+    except curses.error as e:
+        if "terminfo" not in str(e):
+            raise
+        # Terminal type (e.g. xterm-ghostty) has no system terminfo entry; fall
+        # back to xterm-256color which curses always knows about.
+        _LOG.warning("TERM=%r has no terminfo entry; falling back to xterm-256color", os.environ.get("TERM"))
+        os.environ["TERM"] = "xterm-256color"
+        curses.wrapper(_curses_main)
 
 
 def _main(
