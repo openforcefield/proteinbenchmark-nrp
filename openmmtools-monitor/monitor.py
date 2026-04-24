@@ -625,6 +625,22 @@ NDArray = np.ndarray[Any, np.dtype[Any]]
 
 
 @dataclass
+class RenderFrame:
+    """All data needed to render one iteration of the simulation."""
+    iteration:    int
+    replica_states: NDArray
+    energies:       NDArray
+    acc_sum:        NDArray
+    prop_sum:       NDArray
+    state_counts:   NDArray
+    half_trips:     NDArray
+    t_kin:          list[str]
+    t_kin_at:       list[int]
+    vol:            list[str]
+    vol_at:         list[int]
+
+
+@dataclass
 class MonitorState:
     """All mutable runtime state for the monitor event loop."""
 
@@ -650,15 +666,7 @@ class MonitorState:
     solute_sel_str: str
 
     # ── Dimension-dependent arrays (init=False; set in __post_init__) ─────
-    acc_sum:         NDArray = field(init=False)
-    prop_sum:        NDArray = field(init=False)
-    state_counts:    NDArray = field(init=False)
-    half_trips:      NDArray = field(init=False)
-    last_extreme:    list[int | None] = field(init=False)
-    cached_t_kin:    list[str] = field(init=False)
-    cached_vol:      list[str] = field(init=False)
-    cached_t_kin_at: list[int] = field(init=False)
-    cached_vol_at:   list[int] = field(init=False)
+    last_extreme: list[int | None] = field(init=False)
 
     # ── Accumulated exchange/energy state ─────────────────────────────────
     prev_iter:         int = -2
@@ -711,47 +719,28 @@ class MonitorState:
 
     # ── Scrub state ───────────────────────────────────────────────────────
     scrub_iter:         int | None = None
-    scrub_dirty:        bool = False
-    scrub_states:       NDArray | None = None
-    scrub_energies:     NDArray | None = None
-    scrub_acc_sum:      NDArray | None = None
-    scrub_prop_sum:     NDArray | None = None
-    scrub_state_counts: NDArray | None = None
-    scrub_half_trips:   NDArray | None = None
-    scrub_t_kin:        list[str] | None = None
-    scrub_t_kin_at:     list[int] | None = None
-    scrub_vol:          list[str] | None = None
-    scrub_vol_at:       list[int] | None = None
+    scrub_frame:        RenderFrame | None = None
     scrub_checkpoints:  list[Any] = field(default_factory=list)
     scrub_input_active: bool = False
     scrub_input_buf:    str  = ""
 
     # ── Render state (populated by _poll) ─────────────────────────────────
-    ever_polled:    bool = False
-    waiting:        bool = True
-    display_iter:   int  = 0
-    replica_states: NDArray | None = None
-    energies:       NDArray | None = None
-    sim_str:        str  = ""
-    iter_str:       str  = ""
-    timing_str:     str  = ""
-    error_text:     str  = ""
-    fe_iters:       list[int]   = field(default_factory=list)
-    fe_vals:        list[float] = field(default_factory=list)
+    live_frame:   RenderFrame | None = None
+    ever_polled:  bool = False
+    waiting:      bool = True
+    display_iter: int  = 0
+    sim_str:      str  = ""
+    iter_str:     str  = ""
+    timing_str:   str  = ""
+    error_text:   str  = ""
+    fe_iters:     list[int]   = field(default_factory=list)
+    fe_vals:      list[float] = field(default_factory=list)
 
     # ── Topology (populated after construction) ────────────────────────────
     topology_molecules: list[tuple[str, list[int]]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        self.acc_sum         = np.zeros((self.n_states, self.n_states))
-        self.prop_sum        = np.zeros((self.n_states, self.n_states))
-        self.state_counts    = np.zeros((self.n_replicas, self.n_states), dtype=int)
-        self.half_trips      = np.zeros(self.n_replicas, dtype=int)
-        self.last_extreme    = [None] * self.n_replicas
-        self.cached_t_kin    = ["—"] * self.n_replicas
-        self.cached_vol      = ["—"] * self.n_replicas
-        self.cached_t_kin_at = [-1] * self.n_replicas
-        self.cached_vol_at   = [-1] * self.n_replicas
+        self.last_extreme = [None] * self.n_replicas
 
 
 def _centroid_rmsd_gen(state: MonitorState) -> Generator[None, None, None]:
@@ -1333,8 +1322,8 @@ def _handle_key(key: int, state: MonitorState) -> tuple[bool, bool]:
                 else:
                     target = state.display_iter + 1 + n
                 target = max(0, min(state.display_iter, target))
-                state.scrub_iter  = target
-                state.scrub_dirty = True
+                state.scrub_iter = target
+                state.scrub_frame = None
             except ValueError:
                 pass  # user typed a non-integer; silently discard and close the prompt
             state.scrub_input_active = False
@@ -1436,23 +1425,21 @@ def _handle_key(key: int, state: MonitorState) -> tuple[bool, bool]:
             state.rmsd_input_buf = state.solute_sel_str
             state.rmsd_sel_error = ""
             return True, False
-        elif key == ord("j") and not state.waiting and state.replica_states is not None:
+        elif key == ord("j") and not state.waiting and state.live_frame is not None:
             state.scrub_input_active = True
             state.scrub_input_buf    = ""
             return True, False
-        elif key == ord("z") and not state.waiting and state.replica_states is not None:
+        elif key == ord("z") and not state.waiting and state.live_frame is not None:
             if state.scrub_iter is not None:
                 # Go live — unpin
-                state.scrub_iter     = None
-                state.scrub_dirty    = False
-                state.scrub_states   = None
-                state.scrub_energies = None
+                state.scrub_iter  = None
+                state.scrub_frame = None
             else:
                 # Freeze — pin to the current live iteration
-                state.scrub_iter  = state.display_iter
-                state.scrub_dirty = True
+                state.scrub_iter = state.display_iter
+                state.scrub_frame = None
             return True, False
-        elif key in (ord("w"), ord("e"), ord("W"), ord("E")) and not state.waiting and state.replica_states is not None:
+        elif key in (ord("w"), ord("e"), ord("W"), ord("E")) and not state.waiting and state.live_frame is not None:
             total     = state.display_iter + 1
             fast_step = max(1, total // 20)
             current   = state.scrub_iter if state.scrub_iter is not None else state.display_iter
@@ -1466,13 +1453,11 @@ def _handle_key(key: int, state: MonitorState) -> tuple[bool, bool]:
                 new_iter = min(state.display_iter, current + fast_step)
             if new_iter >= state.display_iter:
                 # Reached or passed live — unpin
-                state.scrub_iter     = None
-                state.scrub_dirty    = False
-                state.scrub_states   = None
-                state.scrub_energies = None
+                state.scrub_iter  = None
+                state.scrub_frame = None
             else:
-                state.scrub_iter  = new_iter
-                state.scrub_dirty = True
+                state.scrub_iter = new_iter
+                state.scrub_frame = None
             return True, False
         return False, False
 
@@ -2205,11 +2190,13 @@ def _history_scan_gen(
             chunk_end   = min(chunk_start + _HISTORY_CHUNK, state.display_iter + 1)
             chunk       = slice(chunk_start, chunk_end)
             t0 = time.perf_counter()
+            lf = state.live_frame
+            assert lf is not None, "live_frame must be set before history scan runs"
             try:
                 t1 = time.perf_counter()
                 acc_delta, prop_delta = reader.exchange_counts(chunk)
-                state.acc_sum  += acc_delta
-                state.prop_sum += prop_delta
+                lf.acc_sum  += acc_delta
+                lf.prop_sum += prop_delta
                 t2 = time.perf_counter()
                 new_states_arr   = reader.states_range(chunk)
                 t3 = time.perf_counter()
@@ -2223,7 +2210,7 @@ def _history_scan_gen(
                     (t2 - t1) * 1e3, (t3 - t2) * 1e3, (t4 - t3) * 1e3, (t5 - t4) * 1e3,
                 )
                 for r in range(state.n_replicas):
-                    state.state_counts[r] += np.bincount(
+                    lf.state_counts[r] += np.bincount(
                         new_states_arr[:, r], minlength=state.n_states
                     )
                 abs_iters_arr = np.arange(chunk_start, chunk_end)
@@ -2235,9 +2222,9 @@ def _history_scan_gen(
                         col   = new_volumes_ma[:, r]
                         valid = ~np.ma.getmaskarray(col) & np.isfinite(col.data) & (col.data > 0)
                         if valid.any():
-                            last_idx           = int(np.where(valid)[0][-1])
-                            state.cached_vol[r]    = f"{float(col.data[last_idx]):.2f}"
-                            state.cached_vol_at[r] = chunk_start + last_idx + 1
+                            last_idx       = int(np.where(valid)[0][-1])
+                            lf.vol[r]    = f"{float(col.data[last_idx]):.2f}"
+                            lf.vol_at[r] = chunk_start + last_idx + 1
 
                 # T_kin: read velocity arrays at vel_interval boundaries in chunk.
                 if state.has_t_kin and state.vel_interval > 0:
@@ -2249,8 +2236,8 @@ def _history_scan_gen(
                         for r in range(state.n_replicas):
                             t = reader.t_kin(tkin_iter, r)
                             if t is not None:
-                                state.cached_t_kin[r]    = f"{t:.1f}"
-                                state.cached_t_kin_at[r] = tkin_iter + 1
+                                lf.t_kin[r]    = f"{t:.1f}"
+                                lf.t_kin_at[r] = tkin_iter + 1
                         n_tkin_reads += 1
                         _LOG.debug(
                             "  t_kin iter %d: %.1fms (%d replicas)",
@@ -2271,7 +2258,7 @@ def _history_scan_gen(
                             chain[1:] = ext_states
                         else:
                             chain = ext_states
-                        state.half_trips[r]   += int(np.count_nonzero(np.diff(chain)))
+                        lf.half_trips[r]      += int(np.count_nonzero(np.diff(chain)))
                         state.last_extreme[r]  = int(ext_states[-1])
 
                     # Ground-state rows: batch-append energies and volumes.
@@ -2290,11 +2277,11 @@ def _history_scan_gen(
                 state.last_mixed_iter = chunk_end - 1
                 state.scrub_checkpoints.append((
                     state.last_mixed_iter,
-                    state.state_counts.copy(),
-                    state.half_trips.copy(),
+                    lf.state_counts.copy(),
+                    lf.half_trips.copy(),
                     list(state.last_extreme),
-                    state.acc_sum.copy(),
-                    state.prop_sum.copy(),
+                    lf.acc_sum.copy(),
+                    lf.prop_sum.copy(),
                 ))
                 n_chunks += 1
                 _LOG.debug(
@@ -2383,22 +2370,18 @@ def _state0_scan_gen(
 
 
 
-def _fetch_scrub_data(reader: SimulationReader, state: MonitorState) -> None:
-    """Read/compute all per-iteration data for the pinned scrub position."""
-    si         = state.scrub_iter
+def _fetch_scrub_data(reader: SimulationReader, state: MonitorState, si: int) -> RenderFrame:
+    """Build a RenderFrame for the pinned scrub position."""
     n_replicas = state.n_replicas
     n_states   = state.n_states
 
-    state.scrub_states   = reader.replica_states(si)
-    state.scrub_energies = reader.energies(si)
+    replica_states = reader.replica_states(si)
+    energies       = reader.energies(si)
 
     # State counts and half-trips: start from nearest chunk checkpoint then
     # apply the residual (at most one chunk worth) of raw states from the NC.
     checkpoints = state.scrub_checkpoints
-    if checkpoints:
-        idx = bisect.bisect_right([c[0] for c in checkpoints], si) - 1
-    else:
-        idx = -1
+    idx = bisect.bisect_right([c[0] for c in checkpoints], si) - 1 if checkpoints else -1
 
     if idx >= 0:
         _, state_counts, half_trips_arr, last_extreme, acc_sum, prop_sum = checkpoints[idx]
@@ -2428,18 +2411,14 @@ def _fetch_scrub_data(reader: SimulationReader, state: MonitorState) -> None:
             ext_idxs = np.where((col == 0) | (col == n_states_m1))[0]
             if ext_idxs.size > 0:
                 ext_s = col[ext_idxs]
-                chain = (np.concatenate([[last_extreme[r]], ext_s])
-                         if last_extreme[r] is not None else ext_s)
+                _prev = last_extreme[r]
+                chain = (np.concatenate([np.array([_prev]), ext_s])
+                         if _prev is not None else ext_s)
                 half_trips[r] += int(np.count_nonzero(np.diff(chain)))
 
-    state.scrub_acc_sum      = acc_sum
-    state.scrub_prop_sum     = prop_sum
-    state.scrub_state_counts = state_counts
-    state.scrub_half_trips   = np.array(half_trips, dtype=int)
-
     # T_kin at scrub position (nearest vel_interval boundary)
-    scrub_t_kin    = ["—"] * n_replicas
-    scrub_t_kin_at = [si + 1] * n_replicas  # default: current frame (no asterisk)
+    t_kin    = ["—"] * n_replicas
+    t_kin_at = [si + 1] * n_replicas  # default: no asterisk
     if state.has_t_kin:
         for r in range(n_replicas):
             t_at = si
@@ -2448,23 +2427,33 @@ def _fetch_scrub_data(reader: SimulationReader, state: MonitorState) -> None:
                 t_at = (si // state.vel_interval) * state.vel_interval
                 t    = reader.t_kin(t_at, r)
             if t is not None:
-                scrub_t_kin[r]    = f"{t:.1f}"
-                scrub_t_kin_at[r] = t_at + 1
-    state.scrub_t_kin    = scrub_t_kin
-    state.scrub_t_kin_at = scrub_t_kin_at
+                t_kin[r]    = f"{t:.1f}"
+                t_kin_at[r] = t_at + 1
 
-    # Volume at nearest pos_interval boundary (volume not written every iteration)
-    scrub_vol    = ["—"] * n_replicas
-    scrub_vol_at = [si + 1] * n_replicas  # default: current frame (no asterisk)
+    # Volume at nearest pos_interval boundary
+    vol    = ["—"] * n_replicas
+    vol_at = [si + 1] * n_replicas  # default: no asterisk
     if state.has_volume and state.pos_interval > 0:
         v_at = (si // state.pos_interval) * state.pos_interval
         for r in range(n_replicas):
             v = reader.volume(v_at, r)
             if v is not None:
-                scrub_vol[r]    = f"{v:.2f}"
-                scrub_vol_at[r] = v_at + 1
-    state.scrub_vol    = scrub_vol
-    state.scrub_vol_at = scrub_vol_at
+                vol[r]    = f"{v:.2f}"
+                vol_at[r] = v_at + 1
+
+    return RenderFrame(
+        iteration      = si,
+        replica_states = replica_states,
+        energies       = energies,
+        acc_sum        = acc_sum,
+        prop_sum       = prop_sum,
+        state_counts   = state_counts,
+        half_trips     = np.array(half_trips, dtype=int),
+        t_kin          = t_kin,
+        t_kin_at       = t_kin_at,
+        vol            = vol,
+        vol_at         = vol_at,
+    )
 
 
 def _poll(reader: SimulationReader, state: MonitorState, stdscr: curses.window) -> bool:
@@ -2491,9 +2480,11 @@ def _poll(reader: SimulationReader, state: MonitorState, stdscr: curses.window) 
     # History accumulation (exchange counts, ground-state energies/volumes,
     # half-trips) is handled incrementally by _history_scan_gen so that a large
     # finished simulation doesn't block the UI on the first poll.
+    n_replicas = state.n_replicas
+    n_states   = state.n_states
     try:
-        state.replica_states = reader.replica_states(display_iter)
-        state.energies       = reader.energies(display_iter)
+        replica_states = reader.replica_states(display_iter)
+        energies       = reader.energies(display_iter)
     except (OSError, IndexError, RuntimeError):
         state.prev_iter = last_iter - 1  # retry this iteration
         return False
@@ -2503,6 +2494,26 @@ def _poll(reader: SimulationReader, state: MonitorState, stdscr: curses.window) 
         return True
 
     state.error_text = ""
+
+    if state.live_frame is None:
+        state.live_frame = RenderFrame(
+            iteration    = display_iter,
+            replica_states = replica_states,
+            energies       = energies,
+            acc_sum        = np.zeros((n_states, n_states)),
+            prop_sum       = np.zeros((n_states, n_states)),
+            state_counts   = np.zeros((n_replicas, n_states), dtype=int),
+            half_trips     = np.zeros(n_replicas, dtype=int),
+            t_kin          = ["—"] * n_replicas,
+            t_kin_at       = [-1]  * n_replicas,
+            vol            = ["—"] * n_replicas,
+            vol_at         = [-1]  * n_replicas,
+        )
+    else:
+        lf = state.live_frame
+        lf.iteration     = display_iter
+        lf.replica_states = replica_states
+        lf.energies       = energies
 
     # Format timing strings
     sim_ps = (display_iter + 1) * state.n_steps * state.timestep_ps
@@ -2548,8 +2559,9 @@ def _poll(reader: SimulationReader, state: MonitorState, stdscr: curses.window) 
     # Only read T_kin / Volume once history has fully caught up — using the data
     # state (last_mixed_iter) rather than the task flag so we don't race with
     # the task submission that happens after _poll in the main loop.
-    if state.last_mixed_iter >= display_iter:
-        for r in range(state.n_replicas):
+    lf = state.live_frame
+    if lf is not None and state.last_mixed_iter >= display_iter:
+        for r in range(n_replicas):
             if state.has_t_kin:
                 t_iter = display_iter
                 t = reader.t_kin(t_iter, r)
@@ -2558,13 +2570,13 @@ def _poll(reader: SimulationReader, state: MonitorState, stdscr: curses.window) 
                     t_iter = (display_iter // state.vel_interval) * state.vel_interval
                     t = reader.t_kin(t_iter, r)
                 if t is not None:
-                    state.cached_t_kin[r]    = f"{t:.1f}"
-                    state.cached_t_kin_at[r] = t_iter + 1
+                    lf.t_kin[r]    = f"{t:.1f}"
+                    lf.t_kin_at[r] = t_iter + 1
             if state.has_volume:
                 v = reader.volume(display_iter, r)
                 if v is not None:
-                    state.cached_vol[r]    = f"{v:.2f}"
-                    state.cached_vol_at[r] = display_iter + 1
+                    lf.vol[r]    = f"{v:.2f}"
+                    lf.vol_at[r] = display_iter + 1
 
     # Online ΔF
     fe_result = reader.free_energy_history(display_iter)
@@ -2670,22 +2682,15 @@ def _render(stdscr: curses.window, state: MonitorState, gradient: list[int] | No
         stdscr.refresh()
         return
 
-    if state.replica_states is None:
+    frame = state.scrub_frame if state.scrub_frame is not None else state.live_frame
+    if frame is None:
         stdscr.refresh()
         return
 
     n_replicas   = state.n_replicas
     n_states     = state.n_states
     display_iter = state.display_iter
-
-    # Scrub mode: override which per-iteration data is shown
-    _scrubbing        = state.scrub_iter is not None and state.scrub_states is not None
-    _render_states    = state.scrub_states       if _scrubbing else state.replica_states
-    _render_energies  = state.scrub_energies     if _scrubbing else state.energies
-    _render_scounts   = state.scrub_state_counts if _scrubbing else state.state_counts
-    _render_htrips    = state.scrub_half_trips   if _scrubbing else state.half_trips
-    _render_t_kin     = state.scrub_t_kin        if _scrubbing else state.cached_t_kin
-    _render_vol       = state.scrub_vol          if _scrubbing else state.cached_vol
+    _scrubbing   = state.scrub_frame is not None
 
     # While history is loading, show the scan cursor rather than the final iter.
     if state.history_computing and state.last_mixed_iter >= 0:
@@ -2699,10 +2704,9 @@ def _render(stdscr: curses.window, state: MonitorState, gradient: list[int] | No
             _total_str = f"{_total_ps / 1000:.1f} ns" if _total_ps >= 1000 else f"{_total_ps:.1f} ps"
             _sim_str = f"{_sim_str} / {_total_str}"
     elif _scrubbing:
-        _si   = state.scrub_iter
         _tot  = state.n_iterations or (display_iter + 1)
-        _iter_str = f"[{_si + 1}] / {_tot}"
-        _sim_ps   = (_si + 1) * state.n_steps * state.timestep_ps
+        _iter_str = f"[{frame.iteration + 1}] / {_tot}"
+        _sim_ps   = (frame.iteration + 1) * state.n_steps * state.timestep_ps
         _sim_str  = f"[{_sim_ps / 1000:.3f} ns]" if _sim_ps >= 1000 else f"[{_sim_ps:.1f} ps]"
         if state.n_iterations:
             _total_ps  = state.n_iterations * state.n_steps * state.timestep_ps
@@ -2825,7 +2829,7 @@ def _render(stdscr: curses.window, state: MonitorState, gradient: list[int] | No
             spark_title = f"{sp_prefix}  (accumulating...)"
         # Scrub cursor on raster — same logic as sparkline
         if _scrubbing and grid_total > 0:
-            cur_col  = max(0, min(spark_w - 1, int(state.scrub_iter / grid_total * spark_w)))
+            cur_col  = max(0, min(spark_w - 1, int(frame.iteration / grid_total * spark_w)))
             cur_attr = curses.color_pair(_CP_BLUE)
             for r in range(n_states):
                 if spark_grid[r][cur_col][0] == " ":
@@ -2846,7 +2850,7 @@ def _render(stdscr: curses.window, state: MonitorState, gradient: list[int] | No
         )
         # Scrub cursor: blue vertical bar only on empty cells (never overwrites data)
         if _scrubbing and not m.individual_dots and grid_total > 0:
-            cur_col  = max(0, min(spark_w - 1, int(state.scrub_iter / grid_total * spark_w)))
+            cur_col  = max(0, min(spark_w - 1, int(frame.iteration / grid_total * spark_w)))
             cur_attr = curses.color_pair(_CP_BLUE)
             for r in range(n_states):
                 if spark_grid[r][cur_col][0] == " ":
@@ -2900,8 +2904,8 @@ def _render(stdscr: curses.window, state: MonitorState, gradient: list[int] | No
     _addstr(stdscr, xaxis_r + "\n")
 
     # Data rows + sparkline rows (interleaved by state index)
-    _render_acc  = state.scrub_acc_sum  if _scrubbing else state.acc_sum
-    _render_prop = state.scrub_prop_sum if _scrubbing else state.prop_sum
+    _render_acc  = frame.acc_sum
+    _render_prop = frame.prop_sum
     for i in range(n_states):
         _addstr(stdscr, f"  {i:>5}")
         for j in range(n_states):
@@ -2934,13 +2938,9 @@ def _render(stdscr: curses.window, state: MonitorState, gradient: list[int] | No
 
     # Determine whether to show * in column headers / footnote.
     # * means "value is from a different iteration than the one being displayed".
-    _cur_iter_1 = (state.scrub_iter + 1) if _scrubbing else (display_iter + 1)
-    if _scrubbing:
-        _tkin_at_list = state.scrub_t_kin_at if state.scrub_t_kin_at is not None else []
-        _vol_at_list  = state.scrub_vol_at   if state.scrub_vol_at   is not None else []
-    else:
-        _tkin_at_list = state.cached_t_kin_at
-        _vol_at_list  = state.cached_vol_at
+    _cur_iter_1   = frame.iteration + 1
+    _tkin_at_list = frame.t_kin_at
+    _vol_at_list  = frame.vol_at
     # iters where the value is stale (from a frame other than current)
     _tkin_stale_iters = sorted(set(at for at in _tkin_at_list if at >= 0 and at != _cur_iter_1))
     _vol_stale_iters  = sorted(set(at for at in _vol_at_list  if at >= 0 and at != _cur_iter_1))
@@ -3011,28 +3011,28 @@ def _render(stdscr: curses.window, state: MonitorState, gradient: list[int] | No
     _spin_ch  = _spinner[int(time.monotonic() * 4) % len(_spinner)]
 
     for r in range(n_replicas):
-        s = int(_render_states[r])
-        reduced_u_kjmol = float(_render_energies[r, s]) * state.kt_kjmol
+        s = int(frame.replica_states[r])
+        reduced_u_kjmol = float(frame.energies[r, s]) * state.kt_kjmol
         _loading = not _scrubbing and state.last_mixed_iter < display_iter
-        if _loading and state.cached_t_kin_at[r] == -1:
+        if _loading and frame.t_kin_at[r] == -1:
             t_kin_str = f"{_spin_ch:>10}"
         else:
-            t_kin_str = f"{_render_t_kin[r]:>10}"
-        if _loading and state.cached_vol_at[r] == -1:
+            t_kin_str = f"{frame.t_kin[r]:>10}"
+        if _loading and frame.vol_at[r] == -1:
             vol_str = f"{_spin_ch:>13}"
         else:
-            vol_str = f"{_render_vol[r]:>13}"
+            vol_str = f"{frame.vol[r]:>13}"
 
-        max_visits = _render_scounts[r].max()
+        max_visits = frame.state_counts[r].max()
         if max_visits > 0:
             bar = "".join(
-                " " if _render_scounts[r, s2] == 0
-                else _BAR_CHARS[max(1, round(_render_scounts[r, s2] / max_visits * 6))]
+                " " if frame.state_counts[r, s2] == 0
+                else _BAR_CHARS[max(1, round(frame.state_counts[r, s2] / max_visits * 6))]
                 for s2 in range(n_states)
             )
         else:
             bar = " " * n_states
-        trips = _render_htrips[r] // 2
+        trips = frame.half_trips[r] // 2
 
         _addstr(stdscr,
             f"  {r:>7}  {s:>5}  {reduced_u_kjmol:>18.1f}  "
@@ -3055,11 +3055,11 @@ def _render(stdscr: curses.window, state: MonitorState, gradient: list[int] | No
                 pass  # terminal too narrow; skip remaining box lines
 
     _addstr(stdscr, "\n")
-    _rate_iter = state.scrub_iter if _scrubbing else display_iter
+    _rate_iter = frame.iteration
     rate_ps    = (_rate_iter + 1) * state.n_steps * state.timestep_ps
     if rate_ps > 0:
         rate_ns    = rate_ps / 1000
-        trip_rates = [_render_htrips[r] // 2 / rate_ns for r in range(n_replicas)]
+        trip_rates = [frame.half_trips[r] // 2 / rate_ns for r in range(n_replicas)]
         avg_rate   = float(np.mean(trip_rates))
         _addstr(stdscr,
             f"  Round trip rate: {avg_rate:.2f} trips/ns avg  "
@@ -3233,14 +3233,15 @@ def _main(
                     needs_redraw = True
 
         # ── Scrub data fetch (when pinned to a non-live iteration) ───────────
-        if state.scrub_dirty and state.scrub_iter is not None:
+        _si = state.scrub_iter
+        if _si is not None and (state.scrub_frame is None or state.scrub_frame.iteration != _si):
             try:
-                _fetch_scrub_data(reader, state)
+                state.scrub_frame = _fetch_scrub_data(reader, state, _si)
             except (OSError, IndexError, RuntimeError):
-                _LOG.warning("failed to fetch scrub data at iter %d; un-pinning", state.scrub_iter, exc_info=True)
+                _LOG.warning("failed to fetch scrub data at iter %d; un-pinning", _si, exc_info=True)
                 state.scrub_iter = None
-            state.scrub_dirty = False
-            needs_redraw  = True
+                state.scrub_frame = None
+            needs_redraw = True
 
         # ── Terminal resize (KEY_RESIZE unreliable under nodelay on Linux) ─
         try:
