@@ -619,28 +619,6 @@ def _kabsch_align(
     return np.array(P_c @ R.T)
 
 
-def _centroid_rmsd_vals(
-    frames: list[np.ndarray[Any, np.dtype[Any]]],
-) -> list[float]:
-    """Per-frame RMSD (Å) to the centroid (mean superposed structure).
-
-    All frames are first aligned to frame 0 via Kabsch superposition; the
-    centroid is then the coordinate-wise mean of the aligned ensemble.  One
-    Procrustes iteration is sufficient for monitoring purposes.
-    """
-    if not frames:
-        return []
-    ref = frames[0]
-    aligned: list[np.ndarray[Any, np.dtype[Any]]] = [
-        ref - ref.mean(axis=0)
-    ] + [_kabsch_align(f, ref) for f in frames[1:]]
-    centroid: np.ndarray[Any, np.dtype[Any]] = np.mean(aligned, axis=0)
-    return [
-        float(np.sqrt(np.mean(np.sum((a - centroid) ** 2, axis=-1)))) * 10.0
-        for a in aligned
-    ]
-
-
 # ── Monitor state ──────────────────────────────────────────────────────────────
 
 NDArray = np.ndarray[Any, np.dtype[Any]]
@@ -747,8 +725,6 @@ class MonitorState:
     scrub_checkpoints:  list[Any] = field(default_factory=list)
     scrub_input_active: bool = False
     scrub_input_buf:    str  = ""
-    scrub_last_key:     int | None = None
-    scrub_hold_start:   float = 0.0
 
     # ── Render state (populated by _poll) ─────────────────────────────────
     ever_polled:    bool = False
@@ -1686,25 +1662,6 @@ def _grid_acf(
 def _xaxis_m_acf(state: MonitorState) -> str:
     return f"{state.n_pos_frames} frames" if state.n_pos_frames else ""
 
-def _data_cluster_occupancy(state: MonitorState, _w: int) -> tuple[list[int], list[float]]:
-    k = state.cluster_k
-    if not k or not state.cluster_labels:
-        return [], []
-    n = len(state.cluster_labels)
-    return list(range(k)), [state.cluster_labels.count(c) / n for c in range(k)]
-
-def _grid_cluster_occupancy(
-    state: MonitorState, sp_iters: list[int], total_iters: int
-) -> tuple[int, str, str]:
-    k = state.cluster_k or 1
-    return k - 1, "cluster 0", f"cluster {k - 1}"
-
-def _xaxis_m_cluster_occupancy(state: MonitorState) -> str:
-    k   = state.cluster_k
-    lab = "choosing k…" if state.k_choosing else (f"k={k}" if k else "")
-    n   = len(state.cluster_labels)
-    return f"{lab}  {n} frames" if n else lab
-
 
 # ── poll helpers ───────────────────────────────────────────────────────────────
 
@@ -1938,21 +1895,6 @@ def _poll_cluster(state: MonitorState, runner: TaskRunner) -> None:
             and n != state.cluster_n_frames_cached):
         state.cluster_computing = True
         runner.submit(_cluster_gen(state))
-
-
-def _raster_state0_replica(
-    state: MonitorState, spark_w: int, n_rows: int, total_iters: int, has_256: bool
-) -> list[list[tuple[str, int]]]:
-    """Scatter plot: x=time, y=physical replica occupying state 0, colour=green."""
-    grid: list[list[tuple[str, int]]] = [[(" ", 0)] * spark_w for _ in range(n_rows)]
-    if total_iters == 0 or not state.pos_frame_replicas:
-        return grid
-    attr = curses.color_pair(_CP_GREEN)
-    for frame_iter, replica in zip(state.pos_frame_iters, state.pos_frame_replicas):
-        col = min(spark_w - 1, int(frame_iter / total_iters * spark_w))
-        if 0 <= replica < n_rows:
-            grid[replica][col] = ("█", attr)
-    return grid
 
 
 def _bar_cluster_occupancy(
