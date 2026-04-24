@@ -6,7 +6,6 @@ import logging
 import math
 import textwrap
 import time
-import types
 import xml.etree.ElementTree as ET
 import zlib
 from collections.abc import Callable, Generator, Sequence
@@ -642,16 +641,153 @@ def _centroid_rmsd_vals(
     ]
 
 
-def _centroid_rmsd_gen(S: types.SimpleNamespace) -> Generator[None, None, None]:
+# ── Monitor state ──────────────────────────────────────────────────────────────
+
+NDArray = np.ndarray[Any, np.dtype[Any]]
+
+
+@dataclass
+class MonitorState:
+    """All mutable runtime state for the monitor event loop."""
+
+    # ── Dimension parameters (required, no default) ───────────────────────
+    n_replicas: int
+    n_states: int
+
+    # ── Reader-derived static properties ──────────────────────────────────
+    storage_path: Path
+    title: str
+    interval: float
+    n_steps: int
+    timestep_ps: float
+    ref_temp_k: float
+    kt_kjmol: float
+    n_iterations: int | None
+    has_t_kin: bool
+    has_volume: bool
+    pos_interval: int
+    n_atoms: int
+    vel_interval: int
+    solute_atom_sel: list[int] | None
+    solute_sel_str: str
+
+    # ── Dimension-dependent arrays (init=False; set in __post_init__) ─────
+    acc_sum:         NDArray = field(init=False)
+    prop_sum:        NDArray = field(init=False)
+    state_counts:    NDArray = field(init=False)
+    half_trips:      NDArray = field(init=False)
+    last_extreme:    list[int | None] = field(init=False)
+    cached_t_kin:    list[str] = field(init=False)
+    cached_vol:      list[str] = field(init=False)
+    cached_t_kin_at: list[int] = field(init=False)
+    cached_vol_at:   list[int] = field(init=False)
+
+    # ── Accumulated exchange/energy state ─────────────────────────────────
+    prev_iter:         int = -2
+    last_mixed_iter:   int = -1
+    ground_u_history:  list[float] = field(default_factory=list)
+    ground_u_iters:    list[int]   = field(default_factory=list)
+    ground_vol_history: list[float] = field(default_factory=list)
+    ground_vol_iters:   list[int]   = field(default_factory=list)
+
+    # ── Position / RMSD state ─────────────────────────────────────────────
+    state0_replica_iters: list[int]   = field(default_factory=list)
+    state0_replica_vals:  list[float] = field(default_factory=list)
+    state0_scan_iter:     int  = 0
+    state0_scanning:      bool = False
+    pos_frame_iters:      list[int] = field(default_factory=list)
+    pos_frame_replicas:   list[int] = field(default_factory=list)
+    pos_all_frames:       list[Any] = field(default_factory=list)
+    pairwise_rmsd_mat:    list[Any] = field(default_factory=list)
+    n_pos_frames:         int = 0
+    centroid_rmsd_cache:      list[float] = field(default_factory=list)
+    centroid_n_frames_cached: int  = 0
+    centroid_computing:       bool = False
+    medoid_rmsd_cache:        list[float] = field(default_factory=list)
+    medoid_n_frames_cached:   int  = 0
+    medoid_computing:         bool = False
+    cluster_k:                int | None = None
+    k_choosing:               bool = False
+    k_chosen_n_frames:        int  = 0
+    cluster_labels:            list[int]  = field(default_factory=list)
+    cluster_medoids:           list[int]  = field(default_factory=list)
+    cluster_outlier_mask:      list[bool] = field(default_factory=list)
+    cluster_intercluster_dists: list[Any] = field(default_factory=list)
+    cluster_n_frames_cached:   int  = 0
+    cluster_computing:         bool = False
+    pos_scan_iter:             int  = 0
+
+    # ── Background task flags ─────────────────────────────────────────────
+    history_computing:    bool = False
+    history_bulk_loading: bool = True
+    rmsd_computing:       bool = False
+
+    # ── UI state ──────────────────────────────────────────────────────────
+    sparkline_mode:    int  = 0
+    show_spark_help:   bool = False
+    rmsd_input_active: bool = False
+    rmsd_input_buf:    str  = ""
+    rmsd_sel_error:    str  = ""
+    flash_msg:         str  = ""
+    flash_until:       float = 0.0
+
+    # ── Scrub state ───────────────────────────────────────────────────────
+    scrub_iter:         int | None = None
+    scrub_dirty:        bool = False
+    scrub_states:       NDArray | None = None
+    scrub_energies:     NDArray | None = None
+    scrub_acc_sum:      NDArray | None = None
+    scrub_prop_sum:     NDArray | None = None
+    scrub_state_counts: NDArray | None = None
+    scrub_half_trips:   NDArray | None = None
+    scrub_t_kin:        list[str] | None = None
+    scrub_t_kin_at:     list[int] | None = None
+    scrub_vol:          list[str] | None = None
+    scrub_vol_at:       list[int] | None = None
+    scrub_checkpoints:  list[Any] = field(default_factory=list)
+    scrub_input_active: bool = False
+    scrub_input_buf:    str  = ""
+    scrub_last_key:     int | None = None
+    scrub_hold_start:   float = 0.0
+
+    # ── Render state (populated by _poll) ─────────────────────────────────
+    ever_polled:    bool = False
+    waiting:        bool = True
+    display_iter:   int  = 0
+    replica_states: NDArray | None = None
+    energies:       NDArray | None = None
+    sim_str:        str  = ""
+    iter_str:       str  = ""
+    timing_str:     str  = ""
+    error_text:     str  = ""
+    fe_iters:       list[int]   = field(default_factory=list)
+    fe_vals:        list[float] = field(default_factory=list)
+
+    # ── Topology (populated after construction) ────────────────────────────
+    topology_molecules: list[tuple[str, list[int]]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.acc_sum         = np.zeros((self.n_states, self.n_states))
+        self.prop_sum        = np.zeros((self.n_states, self.n_states))
+        self.state_counts    = np.zeros((self.n_replicas, self.n_states), dtype=int)
+        self.half_trips      = np.zeros(self.n_replicas, dtype=int)
+        self.last_extreme    = [None] * self.n_replicas
+        self.cached_t_kin    = ["—"] * self.n_replicas
+        self.cached_vol      = ["—"] * self.n_replicas
+        self.cached_t_kin_at = [-1] * self.n_replicas
+        self.cached_vol_at   = [-1] * self.n_replicas
+
+
+def _centroid_rmsd_gen(state: MonitorState) -> Generator[None, None, None]:
     """Compute centroid RMSD incrementally, yielding after each Kabsch alignment.
 
-    Snapshots ``S.pos_all_frames`` at entry so mid-run frame additions do not
-    corrupt the ensemble.  Writes results to ``S.centroid_rmsd_cache`` and
-    ``S.centroid_n_frames_cached`` atomically at the end.  Clears
-    ``S.centroid_computing`` on exit (including on exception).
+    Snapshots ``state.pos_all_frames`` at entry so mid-run frame additions do not
+    corrupt the ensemble.  Writes results to ``state.centroid_rmsd_cache`` and
+    ``state.centroid_n_frames_cached`` atomically at the end.  Clears
+    ``state.centroid_computing`` on exit (including on exception).
     """
     try:
-        frames = list(S.pos_all_frames)   # snapshot — immune to concurrent appends
+        frames = list(state.pos_all_frames)   # snapshot — immune to concurrent appends
         n = len(frames)
         if n == 0:
             return
@@ -661,26 +797,26 @@ def _centroid_rmsd_gen(S: types.SimpleNamespace) -> Generator[None, None, None]:
             aligned.append(_kabsch_align(f, ref))
             yield
         centroid: np.ndarray[Any, np.dtype[Any]] = np.mean(aligned, axis=0)
-        S.centroid_rmsd_cache = [
+        state.centroid_rmsd_cache = [
             float(np.sqrt(np.mean(np.sum((a - centroid) ** 2, axis=-1)))) * 10.0
             for a in aligned
         ]
-        S.centroid_n_frames_cached = n
+        state.centroid_n_frames_cached = n
     finally:
-        S.centroid_computing = False
+        state.centroid_computing = False
 
 
-def _medoid_rmsd_gen(S: types.SimpleNamespace) -> Generator[None, None, None]:
+def _medoid_rmsd_gen(state: MonitorState) -> Generator[None, None, None]:
     """Compute medoid RMSD from the pairwise matrix without any additional Kabsch SVDs.
 
-    Snapshots ``S.pairwise_rmsd_mat`` at entry.  Builds the symmetric distance
+    Snapshots ``state.pairwise_rmsd_mat`` at entry.  Builds the symmetric distance
     matrix one row at a time (yielding after each row), finds the frame that
     minimises the sum of pairwise distances (the medoid), then stores per-frame
-    RMSDs to the medoid in ``S.medoid_rmsd_cache``.  Clears ``S.medoid_computing``
+    RMSDs to the medoid in ``state.medoid_rmsd_cache``.  Clears ``state.medoid_computing``
     on exit.
     """
     try:
-        mat_rows = [list(row) for row in S.pairwise_rmsd_mat]  # snapshot
+        mat_rows = [list(row) for row in state.pairwise_rmsd_mat]  # snapshot
         n = len(mat_rows)
         if n < 2:
             return
@@ -690,10 +826,10 @@ def _medoid_rmsd_gen(S: types.SimpleNamespace) -> Generator[None, None, None]:
             yield
         mat = mat + mat.T
         medoid_idx = int(np.argmin(mat.sum(axis=1)))
-        S.medoid_rmsd_cache = (mat[:, medoid_idx] * 10.0).tolist()
-        S.medoid_n_frames_cached = n
+        state.medoid_rmsd_cache = (mat[:, medoid_idx] * 10.0).tolist()
+        state.medoid_n_frames_cached = n
     finally:
-        S.medoid_computing = False
+        state.medoid_computing = False
 
 
 # ── Data-source abstraction ────────────────────────────────────────────────────
@@ -1155,22 +1291,16 @@ def _init_state(
     n_iterations_arg: int | None,
     init_atom_sel: list[int] | None,
     interval: float,
-    storage: "Path",
-) -> types.SimpleNamespace:
-    """Build initial mutable state namespace from a SimulationReader."""
-    n_replicas   = reader.n_replicas
-    n_states     = reader.n_states
+    storage: Path,
+) -> MonitorState:
+    """Build initial state from a SimulationReader."""
     n_iterations = n_iterations_arg if n_iterations_arg is not None else reader.n_iterations
-
-    return types.SimpleNamespace(
-        # Derived from reader static properties
+    return MonitorState(
+        n_replicas=reader.n_replicas,
+        n_states=reader.n_states,
         storage_path=storage,
         title=reader.get_title(),
-        flash_msg="",
-        flash_until=0.0,
         interval=interval,
-        n_replicas=n_replicas,
-        n_states=n_states,
         n_steps=reader.steps_per_iter,
         timestep_ps=reader.timestep_ps,
         ref_temp_k=reader.ref_temp_k,
@@ -1181,102 +1311,23 @@ def _init_state(
         pos_interval=reader.pos_interval,
         n_atoms=reader.n_atoms,
         vel_interval=reader.vel_interval,
-        # Accumulated exchange/energy state
-        prev_iter=-2,
-        acc_sum=np.zeros((n_states, n_states)),
-        prop_sum=np.zeros((n_states, n_states)),
-        state_counts=np.zeros((n_replicas, n_states), dtype=int),
-        last_extreme=[None] * n_replicas,
-        half_trips=np.zeros(n_replicas, dtype=int),
-        last_mixed_iter=-1,
-        ground_u_history=[],
-        ground_u_iters=[],
-        ground_vol_history=[],
-        ground_vol_iters=[],
-        # T_kin / Volume cache
-        cached_t_kin=["—"] * n_replicas,
-        cached_vol=["—"] * n_replicas,
-        cached_t_kin_at=[-1] * n_replicas,
-        cached_vol_at=[-1] * n_replicas,
-        # Position / RMSD state
         solute_atom_sel=init_atom_sel,
         solute_sel_str=(f"0-{init_atom_sel[-1]}" if init_atom_sel is not None else ""),
-        state0_replica_iters=[],      # iteration index for each state-0 replica record
-        state0_replica_vals=[],       # float replica index at each recorded iteration
-        state0_scan_iter=0,           # next iteration to scan for state-0 replica
-        state0_scanning=False,        # True while _state0_scan_gen is running
-        pos_frame_iters=[],
-        pos_all_frames=[],
-        pairwise_rmsd_mat=[],
-        n_pos_frames=0,
-        centroid_rmsd_cache=[],       # per-frame centroid RMSD (Å); recomputed when frame count changes
-        centroid_n_frames_cached=0,   # len(pos_all_frames) when centroid_rmsd_cache was last computed
-        centroid_computing=False,     # True while _centroid_rmsd_gen task is in the runner
-        medoid_rmsd_cache=[],         # per-frame medoid RMSD (Å); recomputed when frame count changes
-        medoid_n_frames_cached=0,     # len(pairwise_rmsd_mat) when medoid_rmsd_cache was last computed
-        medoid_computing=False,       # True while _medoid_rmsd_gen task is in the runner
-        cluster_k=None,               # int | None — k chosen by bootstrap stability
-        k_choosing=False,             # True while _stability_choose_k_gen is running
-        k_chosen_n_frames=0,          # n_pos_frames when cluster_k was last chosen
-        cluster_labels=[],               # int cluster index per frame; written atomically by _cluster_gen
-        cluster_medoids=[],              # frame indices of medoids
-        cluster_outlier_mask=[],         # bool per frame: True if dist_to_medoid > mean+N*std
-        cluster_intercluster_dists=[],   # k×k list[list[float]] of inter-medoid distances
-        cluster_n_frames_cached=0,       # n_pos_frames when cluster_labels was last computed
-        cluster_computing=False,         # True while _cluster_gen task is in the runner
-        pos_scan_iter=0,      # next iteration index to attempt for RMSD accumulation
-        history_computing=False,    # True while _history_scan_gen task is in the runner
-        history_bulk_loading=True,  # False after the first history scan completes
-        rmsd_computing=False,     # True while _rmsd_gen task is in the runner
-        # UI state
-        sparkline_mode=0,
-        show_spark_help=False,
-        rmsd_input_active=False,
-        rmsd_input_buf="",
-        rmsd_sel_error="",
-        # Scrub state
-        scrub_iter=None,          # None = live; int = pinned display iteration
-        scrub_dirty=False,        # True when scrub_iter changed and data not yet read
-        scrub_states=None,        # replica_states at scrub_iter
-        scrub_energies=None,      # energies at scrub_iter
-        scrub_acc_sum=None,       # (n_states, n_states) accepted counts up to scrub_iter
-        scrub_prop_sum=None,      # (n_states, n_states) proposed counts up to scrub_iter
-        scrub_state_counts=None,  # (n_replicas, n_states) counts up to scrub_iter
-        scrub_half_trips=None,    # (n_replicas,) half-trips up to scrub_iter
-        scrub_t_kin=None,         # per-replica T_kin strings at scrub_iter
-        scrub_t_kin_at=None,      # per-replica 1-based iter T_kin was read from
-        scrub_vol=None,           # per-replica volume strings at scrub_iter
-        scrub_vol_at=None,        # per-replica 1-based iter volume was read from
-        scrub_checkpoints=[],     # [(last_iter, state_counts, half_trips, last_extreme), …]
-        scrub_input_active=False, # True while typing a jump iteration
-        scrub_input_buf="",
-        # Current render state (populated by _poll)
-        ever_polled=False,  # True after the first _poll attempt, regardless of result
-        waiting=True,
-        display_iter=0,
-        replica_states=None,
-        energies=None,
-        sim_str="",
-        iter_str="",
-        timing_str="",
-        error_text="",
-        fe_iters=[],
-        fe_vals=[],
     )
 
 
-def _export_medoids_pdb(S: types.SimpleNamespace) -> str:
+def _export_medoids_pdb(state: MonitorState) -> str:
     """Write each cluster medoid as a MODEL in a PDB file. Returns output path or ''."""
-    if not S.cluster_medoids or not S.pos_all_frames:
+    if not state.cluster_medoids or not state.pos_all_frames:
         return ""
-    out_path = S.storage_path.with_name(S.storage_path.stem + "_medoids.pdb")
+    out_path = state.storage_path.with_name(state.storage_path.stem + "_medoids.pdb")
     with open(out_path, "w") as fh:
-        for model_num, med_idx in enumerate(S.cluster_medoids, 1):
-            if med_idx >= len(S.pos_all_frames):
+        for model_num, med_idx in enumerate(state.cluster_medoids, 1):
+            if med_idx >= len(state.pos_all_frames):
                 continue
-            pos_ang = np.asarray(S.pos_all_frames[med_idx]) * 10.0  # nm → Å
+            pos_ang = np.asarray(state.pos_all_frames[med_idx]) * 10.0  # nm → Å
             fh.write(f"MODEL     {model_num:4d}\n")
-            fh.write(f"REMARK cluster {model_num}  frame {S.pos_frame_iters[med_idx]}\n")
+            fh.write(f"REMARK cluster {model_num}  frame {state.pos_frame_iters[med_idx]}\n")
             for serial, (x, y, z) in enumerate(pos_ang, 1):
                 fh.write(
                     f"ATOM  {serial:5d}  CA  UNK A{serial:4d}    "
@@ -1287,7 +1338,7 @@ def _export_medoids_pdb(S: types.SimpleNamespace) -> str:
     return str(out_path)
 
 
-def _handle_key(key: int, S: types.SimpleNamespace) -> tuple[bool, bool]:
+def _handle_key(key: int, state: MonitorState) -> tuple[bool, bool]:
     """Handle a keypress. Returns (needs_redraw, should_quit)."""
     if key == -1:
         return False, False
@@ -1295,156 +1346,157 @@ def _handle_key(key: int, S: types.SimpleNamespace) -> tuple[bool, bool]:
         return False, True  # always quit regardless of mode
 
     # ── Jump-to-iteration input mode ───────────────────────────────────────
-    if S.scrub_input_active:
+    if state.scrub_input_active:
         if key in (ord("\n"), ord("\r"), curses.KEY_ENTER):
             try:
-                n = int(S.scrub_input_buf)
+                n = int(state.scrub_input_buf)
                 # Positive: 1-based iteration number.
                 # Negative: offset from end (-1 = last, -2 = second-to-last, …)
                 if n >= 0:
                     target = n - 1
                 else:
-                    target = S.display_iter + 1 + n
-                target = max(0, min(S.display_iter, target))
-                S.scrub_iter  = target
-                S.scrub_dirty = True
+                    target = state.display_iter + 1 + n
+                target = max(0, min(state.display_iter, target))
+                state.scrub_iter  = target
+                state.scrub_dirty = True
             except ValueError:
                 pass  # user typed a non-integer; silently discard and close the prompt
-            S.scrub_input_active = False
-            S.scrub_input_buf    = ""
+            state.scrub_input_active = False
+            state.scrub_input_buf    = ""
             return True, False
         elif key == 27:  # Esc cancels
-            S.scrub_input_active = False
-            S.scrub_input_buf    = ""
+            state.scrub_input_active = False
+            state.scrub_input_buf    = ""
             return True, False
         elif key in (curses.KEY_BACKSPACE, 127, 8):
-            S.scrub_input_buf = S.scrub_input_buf[:-1]
+            state.scrub_input_buf = state.scrub_input_buf[:-1]
             return True, False
         elif 0 <= key <= 0x10FFFF and (
             chr(key).isdigit()
-            or (chr(key) == "-" and not S.scrub_input_buf)
+            or (chr(key) == "-" and not state.scrub_input_buf)
         ):
-            S.scrub_input_buf += chr(key)
+            state.scrub_input_buf += chr(key)
             return True, False
         return False, False
 
-    if S.rmsd_input_active:
+    if state.rmsd_input_active:
         if key in (ord("\n"), ord("\r"), curses.KEY_ENTER):
             try:
-                new_sel = _parse_atom_selection(S.rmsd_input_buf)
-                if S.n_atoms > 0 and max(new_sel) >= S.n_atoms:
-                    raise ValueError(f"atom index {max(new_sel)} out of range (max {S.n_atoms - 1})")
-                S.solute_atom_sel = new_sel
-                S.solute_sel_str = S.rmsd_input_buf
-                S.pos_frame_iters           = []
-                S.pos_all_frames            = []
-                S.pairwise_rmsd_mat         = []
-                S.n_pos_frames              = 0
-                S.centroid_rmsd_cache       = []
-                S.centroid_n_frames_cached  = 0
-                S.medoid_rmsd_cache         = []
-                S.medoid_n_frames_cached    = 0
-                S.cluster_k                  = None
-                S.k_choosing                 = False
-                S.k_chosen_n_frames          = 0
-                S.cluster_labels             = []
-                S.cluster_medoids            = []
-                S.cluster_outlier_mask       = []
-                S.cluster_intercluster_dists = []
-                S.cluster_n_frames_cached    = 0
-                S.pos_scan_iter    = 0
-                S.rmsd_computing     = False  # old tasks invalidated; runner drains naturally
-                S.centroid_computing = False
-                S.medoid_computing   = False
-                S.cluster_computing  = False
-                S.rmsd_sel_error   = ""
-                S.rmsd_input_active = False
-                S.rmsd_input_buf = ""
+                new_sel = _parse_atom_selection(state.rmsd_input_buf)
+                if state.n_atoms > 0 and max(new_sel) >= state.n_atoms:
+                    raise ValueError(f"atom index {max(new_sel)} out of range (max {state.n_atoms - 1})")
+                state.solute_atom_sel = new_sel
+                state.solute_sel_str = state.rmsd_input_buf
+                state.pos_frame_iters           = []
+                state.pos_frame_replicas        = []
+                state.pos_all_frames            = []
+                state.pairwise_rmsd_mat         = []
+                state.n_pos_frames              = 0
+                state.centroid_rmsd_cache       = []
+                state.centroid_n_frames_cached  = 0
+                state.medoid_rmsd_cache         = []
+                state.medoid_n_frames_cached    = 0
+                state.cluster_k                  = None
+                state.k_choosing                 = False
+                state.k_chosen_n_frames          = 0
+                state.cluster_labels             = []
+                state.cluster_medoids            = []
+                state.cluster_outlier_mask       = []
+                state.cluster_intercluster_dists = []
+                state.cluster_n_frames_cached    = 0
+                state.pos_scan_iter    = 0
+                state.rmsd_computing     = False  # old tasks invalidated; runner drains naturally
+                state.centroid_computing = False
+                state.medoid_computing   = False
+                state.cluster_computing  = False
+                state.rmsd_sel_error   = ""
+                state.rmsd_input_active = False
+                state.rmsd_input_buf = ""
             except ValueError as exc:
-                S.rmsd_sel_error = str(exc)
+                state.rmsd_sel_error = str(exc)
             return True, False
         elif key == 27:  # Esc cancels
-            S.rmsd_input_active = False
-            S.rmsd_input_buf = ""
+            state.rmsd_input_active = False
+            state.rmsd_input_buf = ""
             return True, False
         elif key in (curses.KEY_BACKSPACE, 127, 8):
-            S.rmsd_input_buf = S.rmsd_input_buf[:-1]
+            state.rmsd_input_buf = state.rmsd_input_buf[:-1]
             return True, False
         elif 0 <= key <= 0x10FFFF and chr(key) in "0123456789-,":
-            S.rmsd_input_buf += chr(key)
+            state.rmsd_input_buf += chr(key)
             return True, False
         return False, False
     else:
         if key == ord("q"):
             return False, True
         elif key == ord("s"):
-            S.sparkline_mode = (S.sparkline_mode + 1) % len(_SPARK_MODES)
+            state.sparkline_mode = (state.sparkline_mode + 1) % len(_SPARK_MODES)
             return True, False
         elif key == ord("S"):
-            S.sparkline_mode = (S.sparkline_mode - 1) % len(_SPARK_MODES)
+            state.sparkline_mode = (state.sparkline_mode - 1) % len(_SPARK_MODES)
             return True, False
         elif key == ord("?"):
-            S.show_spark_help = not S.show_spark_help
+            state.show_spark_help = not state.show_spark_help
             return True, False
-        elif key == ord("k") and not S.k_choosing and not S.cluster_computing:
-            S.cluster_k                  = None
-            S.k_chosen_n_frames          = 0
-            S.cluster_labels             = []
-            S.cluster_medoids            = []
-            S.cluster_outlier_mask       = []
-            S.cluster_intercluster_dists = []
-            S.cluster_n_frames_cached    = 0
+        elif key == ord("k") and not state.k_choosing and not state.cluster_computing:
+            state.cluster_k                  = None
+            state.k_chosen_n_frames          = 0
+            state.cluster_labels             = []
+            state.cluster_medoids            = []
+            state.cluster_outlier_mask       = []
+            state.cluster_intercluster_dists = []
+            state.cluster_n_frames_cached    = 0
             return True, False
-        elif key == ord("e") and S.cluster_medoids:
-            path = _export_medoids_pdb(S)
+        elif key == ord("e") and state.cluster_medoids and state.scrub_iter is None:
+            path = _export_medoids_pdb(state)
             if path:
-                S.flash_msg   = f"Medoids written → {path}"
+                state.flash_msg   = f"Medoids written → {path}"
             else:
-                S.flash_msg   = "No clusters yet — nothing to export"
-            S.flash_until = time.monotonic() + 6.0
+                state.flash_msg   = "No clusters yet — nothing to export"
+            state.flash_until = time.monotonic() + 6.0
             return True, False
-        elif key == ord("a") and _SPARK_MODES[S.sparkline_mode].needs_atoms:
-            S.rmsd_input_active = True
-            S.rmsd_input_buf = S.solute_sel_str
-            S.rmsd_sel_error = ""
+        elif key == ord("a") and _SPARK_MODES[state.sparkline_mode].needs_atoms:
+            state.rmsd_input_active = True
+            state.rmsd_input_buf = state.solute_sel_str
+            state.rmsd_sel_error = ""
             return True, False
-        elif key == ord("j") and not S.waiting and S.replica_states is not None:
-            S.scrub_input_active = True
-            S.scrub_input_buf    = ""
+        elif key == ord("j") and not state.waiting and state.replica_states is not None:
+            state.scrub_input_active = True
+            state.scrub_input_buf    = ""
             return True, False
-        elif key == ord("z") and not S.waiting and S.replica_states is not None:
-            if S.scrub_iter is not None:
+        elif key == ord("z") and not state.waiting and state.replica_states is not None:
+            if state.scrub_iter is not None:
                 # Go live — unpin
-                S.scrub_iter     = None
-                S.scrub_dirty    = False
-                S.scrub_states   = None
-                S.scrub_energies = None
+                state.scrub_iter     = None
+                state.scrub_dirty    = False
+                state.scrub_states   = None
+                state.scrub_energies = None
             else:
                 # Freeze — pin to the current live iteration
-                S.scrub_iter  = S.display_iter
-                S.scrub_dirty = True
+                state.scrub_iter  = state.display_iter
+                state.scrub_dirty = True
             return True, False
-        elif key in (ord("w"), ord("e"), ord("W"), ord("E")) and not S.waiting and S.replica_states is not None:
-            total     = S.display_iter + 1
+        elif key in (ord("w"), ord("e"), ord("W"), ord("E")) and not state.waiting and state.replica_states is not None:
+            total     = state.display_iter + 1
             fast_step = max(1, total // 20)
-            current   = S.scrub_iter if S.scrub_iter is not None else S.display_iter
+            current   = state.scrub_iter if state.scrub_iter is not None else state.display_iter
             if key == ord("w"):
                 new_iter = max(0, current - 1)
             elif key == ord("e"):
-                new_iter = min(S.display_iter, current + 1)
+                new_iter = min(state.display_iter, current + 1)
             elif key == ord("W"):
                 new_iter = max(0, current - fast_step)
             else:  # ord("E")
-                new_iter = min(S.display_iter, current + fast_step)
-            if new_iter >= S.display_iter:
+                new_iter = min(state.display_iter, current + fast_step)
+            if new_iter >= state.display_iter:
                 # Reached or passed live — unpin
-                S.scrub_iter     = None
-                S.scrub_dirty    = False
-                S.scrub_states   = None
-                S.scrub_energies = None
+                state.scrub_iter     = None
+                state.scrub_dirty    = False
+                state.scrub_states   = None
+                state.scrub_energies = None
             else:
-                S.scrub_iter  = new_iter
-                S.scrub_dirty = True
+                state.scrub_iter  = new_iter
+                state.scrub_dirty = True
             return True, False
         return False, False
 
@@ -1504,12 +1556,12 @@ class SparkMode:
     unit: str
     help_text: str
     # Callable signatures:
-    #   get_data(S, spark_w)  -> (iters, vals)
-    #   get_ref(S, vals)      -> float | None
-    #   get_grid(S, sp_iters, total_iters) -> (grid_total, xaxis_l, xaxis_r)
+    #   get_data(state, spark_w)  -> (iters, vals)
+    #   get_ref(state, vals)      -> float | None
+    #   get_grid(state, sp_iters, total_iters) -> (grid_total, xaxis_l, xaxis_r)
     #                            None = use standard time axis
-    #   xaxis_m_fn(S)         -> centre-label string (overrides auto dot-density label)
-    #   poll(S, runner)       -> None  (submit background recompute tasks as needed)
+    #   xaxis_m_fn(state)         -> centre-label string (overrides auto dot-density label)
+    #   poll(state, runner)       -> None  (submit background recompute tasks as needed)
     get_data: Callable[..., tuple[list[int], list[float]]] = field(repr=False)
     get_ref:  Callable[..., float | None]                  = field(repr=False)
     needs_atoms:    bool = False
@@ -1521,67 +1573,67 @@ class SparkMode:
     xaxis_m_fn:  Callable[..., str] | None                  = field(default=None, repr=False)
     poll:        Callable[..., None] | None                  = field(default=None, repr=False)
     # When set, replaces _build_sparkline_grid for 2-D raster displays.
-    # Signature: (S, spark_w, n_rows, total_iters, has_256) -> list[list[(char, attr)]]
+    # Signature: (state, spark_w, n_rows, total_iters, has_256) -> list[list[(char, attr)]]
     raster_fn:   Callable[..., list[list[tuple[str, int]]]] | None = field(default=None, repr=False)
-    # Fixed y-axis range, bypassing data-driven scaling. Callable so it can depend on S.
-    # Signature: (S,) -> (y_min, y_max)
+    # Fixed y-axis range, bypassing data-driven scaling. Callable so it can depend on state.
+    # Signature: (state,) -> (y_min, y_max)
     y_fixed_range: Callable[..., tuple[float, float]] | None = field(default=None, repr=False)
 
 
 # ── get_data helpers ───────────────────────────────────────────────────────────
 
-def _data_ground_u(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
-    return S.ground_u_iters, S.ground_u_history
+def _data_ground_u(state: MonitorState, _w: int) -> tuple[list[int], list[float]]:
+    return state.ground_u_iters, state.ground_u_history
 
-def _data_ground_vol(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
-    return S.ground_vol_iters, S.ground_vol_history
+def _data_ground_vol(state: MonitorState, _w: int) -> tuple[list[int], list[float]]:
+    return state.ground_vol_iters, state.ground_vol_history
 
-def _data_fe(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
-    return getattr(S, "fe_iters", []), getattr(S, "fe_vals", [])
+def _data_fe(state: MonitorState, _w: int) -> tuple[list[int], list[float]]:
+    return state.fe_iters, state.fe_vals
 
-def _data_rmsd(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
-    if S.n_pos_frames:
-        vals = [0.0] + [S.pairwise_rmsd_mat[i][0] for i in range(1, S.n_pos_frames)]
-        return S.pos_frame_iters, vals
+def _data_rmsd(state: MonitorState, _w: int) -> tuple[list[int], list[float]]:
+    if state.n_pos_frames:
+        vals = [0.0] + [state.pairwise_rmsd_mat[i][0] for i in range(1, state.n_pos_frames)]
+        return state.pos_frame_iters, vals
     return [], []
 
-def _data_min_rmsd(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
-    if S.n_pos_frames > 1:
-        return S.pos_frame_iters[1:], [min(S.pairwise_rmsd_mat[i]) for i in range(1, S.n_pos_frames)]
+def _data_min_rmsd(state: MonitorState, _w: int) -> tuple[list[int], list[float]]:
+    if state.n_pos_frames > 1:
+        return state.pos_frame_iters[1:], [min(state.pairwise_rmsd_mat[i]) for i in range(1, state.n_pos_frames)]
     return [], []
 
-def _data_max_rmsd(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
-    if S.n_pos_frames > 1:
-        return S.pos_frame_iters[1:], [max(S.pairwise_rmsd_mat[i]) for i in range(1, S.n_pos_frames)]
+def _data_max_rmsd(state: MonitorState, _w: int) -> tuple[list[int], list[float]]:
+    if state.n_pos_frames > 1:
+        return state.pos_frame_iters[1:], [max(state.pairwise_rmsd_mat[i]) for i in range(1, state.n_pos_frames)]
     return [], []
 
-def _data_acf(S: types.SimpleNamespace, spark_w: int) -> tuple[list[int], list[float]]:
-    if S.n_pos_frames < 2:
+def _data_acf(state: MonitorState, spark_w: int) -> tuple[list[int], list[float]]:
+    if state.n_pos_frames < 2:
         return [], []
-    max_lag = S.n_pos_frames // 2
+    max_lag = state.n_pos_frames // 2
     n_pts   = min(max_lag, max(4, 2 * spark_w))
     raw_lags = np.unique(np.round(np.geomspace(1, max_lag, n_pts)).astype(int))
     raw_lags = raw_lags[(raw_lags >= 1) & (raw_lags <= max_lag)]
     vals = [
-        float(np.mean([S.pairwise_rmsd_mat[i + int(lag)][i]
-                        for i in range(S.n_pos_frames - int(lag))]))
+        float(np.mean([state.pairwise_rmsd_mat[i + int(lag)][i]
+                        for i in range(state.n_pos_frames - int(lag))]))
         for lag in raw_lags
     ]
     return [int(lag) for lag in raw_lags], vals
 
-def _data_centroid_rmsd(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
-    n = S.centroid_n_frames_cached
-    return S.pos_frame_iters[:n], S.centroid_rmsd_cache
+def _data_centroid_rmsd(state: MonitorState, _w: int) -> tuple[list[int], list[float]]:
+    n = state.centroid_n_frames_cached
+    return state.pos_frame_iters[:n], state.centroid_rmsd_cache
 
-def _data_medoid_rmsd(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
-    n = S.medoid_n_frames_cached
-    return S.pos_frame_iters[:n], S.medoid_rmsd_cache
+def _data_medoid_rmsd(state: MonitorState, _w: int) -> tuple[list[int], list[float]]:
+    n = state.medoid_n_frames_cached
+    return state.pos_frame_iters[:n], state.medoid_rmsd_cache
 
 _STATE0_DOTS_PER_COL = 5  # target rendered points per terminal column in state 0 replica over time view
 
-def _data_state0_replica(S: types.SimpleNamespace, spark_w: int) -> tuple[list[int], list[float]]:
-    iters = S.state0_replica_iters
-    vals  = S.state0_replica_vals
+def _data_state0_replica(state: MonitorState, spark_w: int) -> tuple[list[int], list[float]]:
+    iters = state.state0_replica_iters
+    vals  = state.state0_replica_vals
     n = len(iters)
     if n == 0:
         return [], []
@@ -1591,24 +1643,24 @@ def _data_state0_replica(S: types.SimpleNamespace, spark_w: int) -> tuple[list[i
 
 # ── get_ref helpers ────────────────────────────────────────────────────────────
 
-def _ref_none(S: types.SimpleNamespace, vals: list[float]) -> float | None:
+def _ref_none(state: MonitorState, vals: list[float]) -> float | None:
     return None
 
-def _ref_first(S: types.SimpleNamespace, vals: list[float]) -> float | None:
+def _ref_first(state: MonitorState, vals: list[float]) -> float | None:
     return vals[0] if vals else None
 
-def _ref_mean(S: types.SimpleNamespace, vals: list[float]) -> float | None:
+def _ref_mean(state: MonitorState, vals: list[float]) -> float | None:
     return float(np.mean(vals)) if vals else None
 
-def _ref_min_pairwise(S: types.SimpleNamespace, vals: list[float]) -> float | None:
-    return (min(v for row in S.pairwise_rmsd_mat for v in row)
-            if S.n_pos_frames >= 2 else None)
+def _ref_min_pairwise(state: MonitorState, vals: list[float]) -> float | None:
+    return (min(v for row in state.pairwise_rmsd_mat for v in row)
+            if state.n_pos_frames >= 2 else None)
 
-def _ref_max_pairwise(S: types.SimpleNamespace, vals: list[float]) -> float | None:
-    return (max(v for row in S.pairwise_rmsd_mat for v in row)
-            if S.n_pos_frames >= 2 else None)
+def _ref_max_pairwise(state: MonitorState, vals: list[float]) -> float | None:
+    return (max(v for row in state.pairwise_rmsd_mat for v in row)
+            if state.n_pos_frames >= 2 else None)
 
-def _ref_acf_plateau(S: types.SimpleNamespace, vals: list[float]) -> float | None:
+def _ref_acf_plateau(state: MonitorState, vals: list[float]) -> float | None:
     if len(vals) >= 4:
         half = len(vals) // 2
         return float(np.mean(vals[half:]))
@@ -1618,11 +1670,11 @@ def _ref_acf_plateau(S: types.SimpleNamespace, vals: list[float]) -> float | Non
 # ── get_grid / xaxis_m helpers (ACF only needs custom grid) ───────────────────
 
 def _grid_acf(
-    S: types.SimpleNamespace, sp_iters: list[int], total_iters: int
+    state: MonitorState, sp_iters: list[int], total_iters: int
 ) -> tuple[int, str, str]:
-    frame_ps = S.pos_interval * S.n_steps * S.timestep_ps
+    frame_ps = state.pos_interval * state.n_steps * state.timestep_ps
     if not sp_iters:
-        total_ns = total_iters * S.n_steps * S.timestep_ps / 1000
+        total_ns = total_iters * state.n_steps * state.timestep_ps / 1000
         return total_iters, "0 ns", f"{total_ns:.1f} ns"
     acf_max_lag = max(sp_iters)
     return (
@@ -1631,44 +1683,44 @@ def _grid_acf(
         f"lag {acf_max_lag * frame_ps / 1000:.1f}ns",
     )
 
-def _xaxis_m_acf(S: types.SimpleNamespace) -> str:
-    return f"{S.n_pos_frames} frames" if S.n_pos_frames else ""
+def _xaxis_m_acf(state: MonitorState) -> str:
+    return f"{state.n_pos_frames} frames" if state.n_pos_frames else ""
 
-def _data_cluster_occupancy(S: types.SimpleNamespace, _w: int) -> tuple[list[int], list[float]]:
-    k = S.cluster_k
-    if not k or not S.cluster_labels:
+def _data_cluster_occupancy(state: MonitorState, _w: int) -> tuple[list[int], list[float]]:
+    k = state.cluster_k
+    if not k or not state.cluster_labels:
         return [], []
-    n = len(S.cluster_labels)
-    return list(range(k)), [S.cluster_labels.count(c) / n for c in range(k)]
+    n = len(state.cluster_labels)
+    return list(range(k)), [state.cluster_labels.count(c) / n for c in range(k)]
 
 def _grid_cluster_occupancy(
-    S: types.SimpleNamespace, sp_iters: list[int], total_iters: int
+    state: MonitorState, sp_iters: list[int], total_iters: int
 ) -> tuple[int, str, str]:
-    k = S.cluster_k or 1
+    k = state.cluster_k or 1
     return k - 1, "cluster 0", f"cluster {k - 1}"
 
-def _xaxis_m_cluster_occupancy(S: types.SimpleNamespace) -> str:
-    k   = S.cluster_k
-    lab = "choosing k…" if S.k_choosing else (f"k={k}" if k else "")
-    n   = len(S.cluster_labels)
+def _xaxis_m_cluster_occupancy(state: MonitorState) -> str:
+    k   = state.cluster_k
+    lab = "choosing k…" if state.k_choosing else (f"k={k}" if k else "")
+    n   = len(state.cluster_labels)
     return f"{lab}  {n} frames" if n else lab
 
 
 # ── poll helpers ───────────────────────────────────────────────────────────────
 
-def _poll_centroid(S: types.SimpleNamespace, runner: TaskRunner) -> None:
-    if (not S.centroid_computing
-            and S.pos_all_frames
-            and len(S.pos_all_frames) != S.centroid_n_frames_cached):
-        S.centroid_computing = True
-        runner.submit(_centroid_rmsd_gen(S))
+def _poll_centroid(state: MonitorState, runner: TaskRunner) -> None:
+    if (not state.centroid_computing
+            and state.pos_all_frames
+            and len(state.pos_all_frames) != state.centroid_n_frames_cached):
+        state.centroid_computing = True
+        runner.submit(_centroid_rmsd_gen(state))
 
-def _poll_medoid(S: types.SimpleNamespace, runner: TaskRunner) -> None:
-    if (not S.medoid_computing
-            and S.n_pos_frames >= 2
-            and S.n_pos_frames != S.medoid_n_frames_cached):
-        S.medoid_computing = True
-        runner.submit(_medoid_rmsd_gen(S))
+def _poll_medoid(state: MonitorState, runner: TaskRunner) -> None:
+    if (not state.medoid_computing
+            and state.n_pos_frames >= 2
+            and state.n_pos_frames != state.medoid_n_frames_cached):
+        state.medoid_computing = True
+        runner.submit(_medoid_rmsd_gen(state))
 
 
 _K_MIN_FRAMES          = 20   # minimum frames before attempting k-selection
@@ -1755,17 +1807,17 @@ def _adjusted_rand_index(a: np.ndarray, b: np.ndarray) -> float:
     return (sum_comb_c - expected) / denom if denom > 0 else 1.0
 
 
-def _stability_choose_k_gen(S: types.SimpleNamespace) -> Generator[None, None, None]:
+def _stability_choose_k_gen(state: MonitorState) -> Generator[None, None, None]:
     """Choose k via bootstrap stability using Adjusted Rand Index.
 
     ARI corrects for chance (expected value 0 for random labels, 1 for perfect
     agreement) so it does not systematically favour small k the way the plain
     Rand index does.  We pick the k with the highest mean ARI across
-    _K_BOOTSTRAP_B subsampled replicates.  Writes S.cluster_k and
-    S.k_chosen_n_frames when done.  Clears S.k_choosing on exit.
+    _K_BOOTSTRAP_B subsampled replicates.  Writes state.cluster_k and
+    state.k_chosen_n_frames when done.  Clears state.k_choosing on exit.
     """
     try:
-        mat_rows = [list(row) for row in S.pairwise_rmsd_mat]  # snapshot
+        mat_rows = [list(row) for row in state.pairwise_rmsd_mat]  # snapshot
         n = len(mat_rows)
         k_max = min(_K_MAX, n // 5)
         if k_max < 2:
@@ -1793,26 +1845,26 @@ def _stability_choose_k_gen(S: types.SimpleNamespace) -> Generator[None, None, N
             stabilities[k] = float(np.mean(scores))
 
         chosen_k = max(stabilities, key=lambda k: stabilities[k])
-        S.cluster_k         = chosen_k
-        S.k_chosen_n_frames = n
+        state.cluster_k         = chosen_k
+        state.k_chosen_n_frames = n
         _LOG.debug("k-stability (ARI): chose k=%d from %s", chosen_k, stabilities)
     finally:
-        S.k_choosing = False
+        state.k_choosing = False
 
 
-def _cluster_gen(S: types.SimpleNamespace) -> Generator[None, None, None]:
-    """Assign cluster labels using the current S.cluster_k via k-medoids.
+def _cluster_gen(state: MonitorState) -> Generator[None, None, None]:
+    """Assign cluster labels using the current state.cluster_k via k-medoids.
 
     Snapshots the pairwise matrix at entry, builds the symmetric form (yielding
     per row), then runs _kmedoids (yielding once after each k-1 farthest-point
-    init step and once per PAM update per cluster).  Writes S.cluster_labels and
-    S.cluster_n_frames_cached atomically at the end.  Clears S.cluster_computing.
+    init step and once per PAM update per cluster).  Writes state.cluster_labels and
+    state.cluster_n_frames_cached atomically at the end.  Clears state.cluster_computing.
     """
     try:
-        k = S.cluster_k
+        k = state.cluster_k
         if k is None:
             return
-        mat_rows = [list(row) for row in S.pairwise_rmsd_mat]  # snapshot
+        mat_rows = [list(row) for row in state.pairwise_rmsd_mat]  # snapshot
         n = len(mat_rows)
         if n < k:
             return
@@ -1859,44 +1911,44 @@ def _cluster_gen(S: types.SimpleNamespace) -> Generator[None, None, None]:
         # k×k inter-medoid distance matrix
         intercluster = mat[np.ix_(medoids, medoids)]
 
-        S.cluster_labels            = labels.tolist()
-        S.cluster_medoids           = list(medoids)
-        S.cluster_outlier_mask      = outlier_mask
-        S.cluster_intercluster_dists = intercluster.tolist()
-        S.cluster_n_frames_cached   = n
+        state.cluster_labels            = labels.tolist()
+        state.cluster_medoids           = list(medoids)
+        state.cluster_outlier_mask      = outlier_mask
+        state.cluster_intercluster_dists = intercluster.tolist()
+        state.cluster_n_frames_cached   = n
     finally:
-        S.cluster_computing = False
+        state.cluster_computing = False
 
 
-def _poll_cluster(S: types.SimpleNamespace, runner: TaskRunner) -> None:
-    n = S.n_pos_frames
+def _poll_cluster(state: MonitorState, runner: TaskRunner) -> None:
+    n = state.n_pos_frames
     if n < _K_MIN_FRAMES:
         return
     # Trigger k-selection when we have no k yet or frames have grown significantly.
     # Don't start a new k-selection while a previous one (or label assignment) is running.
-    needs_new_k = S.cluster_k is None or n >= S.k_chosen_n_frames * _K_GROWTH_FACTOR
-    if needs_new_k and not S.k_choosing and not S.cluster_computing:
-        S.k_choosing = True
-        runner.submit(_stability_choose_k_gen(S))
+    needs_new_k = state.cluster_k is None or n >= state.k_chosen_n_frames * _K_GROWTH_FACTOR
+    if needs_new_k and not state.k_choosing and not state.cluster_computing:
+        state.k_choosing = True
+        runner.submit(_stability_choose_k_gen(state))
         return  # wait for k to settle before assigning labels
     # Assign labels whenever frame count changes and k is stable
-    if (S.cluster_k is not None
-            and not S.cluster_computing
-            and not S.k_choosing
-            and n != S.cluster_n_frames_cached):
-        S.cluster_computing = True
-        runner.submit(_cluster_gen(S))
+    if (state.cluster_k is not None
+            and not state.cluster_computing
+            and not state.k_choosing
+            and n != state.cluster_n_frames_cached):
+        state.cluster_computing = True
+        runner.submit(_cluster_gen(state))
 
 
 def _raster_state0_replica(
-    S: types.SimpleNamespace, spark_w: int, n_rows: int, total_iters: int, has_256: bool
+    state: MonitorState, spark_w: int, n_rows: int, total_iters: int, has_256: bool
 ) -> list[list[tuple[str, int]]]:
     """Scatter plot: x=time, y=physical replica occupying state 0, colour=green."""
     grid: list[list[tuple[str, int]]] = [[(" ", 0)] * spark_w for _ in range(n_rows)]
-    if total_iters == 0 or not S.pos_frame_replicas:
+    if total_iters == 0 or not state.pos_frame_replicas:
         return grid
     attr = curses.color_pair(_CP_GREEN)
-    for frame_iter, replica in zip(S.pos_frame_iters, S.pos_frame_replicas):
+    for frame_iter, replica in zip(state.pos_frame_iters, state.pos_frame_replicas):
         col = min(spark_w - 1, int(frame_iter / total_iters * spark_w))
         if 0 <= replica < n_rows:
             grid[replica][col] = ("█", attr)
@@ -1904,15 +1956,15 @@ def _raster_state0_replica(
 
 
 def _bar_cluster_occupancy(
-    S: types.SimpleNamespace, spark_w: int, n_rows: int, total_iters: int, has_256: bool
+    state: MonitorState, spark_w: int, n_rows: int, total_iters: int, has_256: bool
 ) -> list[list[tuple[str, int]]]:
     """Bar chart: x=cluster (+outlier), bar height=fraction of state-0 frames."""
     grid: list[list[tuple[str, int]]] = [[(" ", 0)] * spark_w for _ in range(n_rows)]
-    k = S.cluster_k
-    if not k or not S.cluster_labels:
+    k = state.cluster_k
+    if not k or not state.cluster_labels:
         return grid
-    labels       = S.cluster_labels
-    outlier_mask = S.cluster_outlier_mask
+    labels       = state.cluster_labels
+    outlier_mask = state.cluster_outlier_mask
     total        = len(labels)
     n_outliers   = sum(outlier_mask) if outlier_mask else 0
     # One bar per cluster, plus a grey outlier bar if any exist
@@ -1941,7 +1993,7 @@ def _bar_cluster_occupancy(
 
 
 def _raster_cluster_trajectory(
-    S: types.SimpleNamespace, spark_w: int, n_rows: int, total_iters: int, has_256: bool
+    state: MonitorState, spark_w: int, n_rows: int, total_iters: int, has_256: bool
 ) -> list[list[tuple[str, int]]]:
     """Braille scatter: x=time, y=1D-MDS cluster position, colour=cluster (grey=outlier).
 
@@ -1950,10 +2002,10 @@ def _raster_cluster_trajectory(
     clusters they are structurally intermediate to rather than at an arbitrary row.
     """
     grid: list[list[tuple[str, int]]] = [[(" ", 0)] * spark_w for _ in range(n_rows)]
-    k = S.cluster_k
-    if not k or not S.cluster_labels or total_iters == 0:
+    k = state.cluster_k
+    if not k or not state.cluster_labels or total_iters == 0:
         return grid
-    dists = S.cluster_intercluster_dists
+    dists = state.cluster_intercluster_dists
     if not dists:
         return grid
 
@@ -1961,9 +2013,9 @@ def _raster_cluster_trajectory(
     pos_min, pos_max = float(pos.min()), float(pos.max())
     norm = (pos - pos_min) / (pos_max - pos_min) if pos_max > pos_min else np.full(k, 0.5)
 
-    outlier_mask = S.cluster_outlier_mask
-    medoids      = S.cluster_medoids
-    mat_rows     = S.pairwise_rmsd_mat
+    outlier_mask = state.cluster_outlier_mask
+    medoids      = state.cluster_medoids
+    mat_rows     = state.pairwise_rmsd_mat
     grey_attr    = curses.color_pair(_CP_GREY) | curses.A_DIM
 
     # Braille sub-cell resolution: 2 sub-cols × 4 sub-rows per terminal cell
@@ -1972,7 +2024,7 @@ def _raster_cluster_trajectory(
     bits_grid: list[list[int]] = [[0] * spark_w for _ in range(n_rows)]
     attr_grid: list[list[int]] = [[0] * spark_w for _ in range(n_rows)]
 
-    for i, (frame_iter, cluster) in enumerate(zip(S.pos_frame_iters, S.cluster_labels)):
+    for i, (frame_iter, cluster) in enumerate(zip(state.pos_frame_iters, state.cluster_labels)):
         is_outlier = bool(outlier_mask[i]) if outlier_mask else False
 
         if is_outlier and medoids:
@@ -2149,7 +2201,7 @@ _SPARK_MODES: list[SparkMode] = [
         get_data=_data_state0_replica,
         get_ref=lambda *_: None,
         individual_dots=True,
-        y_fixed_range=lambda S: (-0.5, S.n_replicas - 0.5),
+        y_fixed_range=lambda state: (-0.5, state.n_replicas - 0.5),
     ),
     SparkMode(
         name="cluster occupancy", unit="",
@@ -2163,7 +2215,7 @@ _SPARK_MODES: list[SparkMode] = [
             "averaged; the k with the highest mean ARI wins.  k is recomputed when "
             "frame count grows by _K_GROWTH_FACTOR; press 'k' to force a recompute."
         ),
-        get_data=lambda S, _: ([], []), get_ref=lambda *_: None,
+        get_data=lambda state, _: ([], []), get_ref=lambda *_: None,
         needs_atoms=True, raster_fn=_bar_cluster_occupancy, poll=_poll_cluster,
     ),
     SparkMode(
@@ -2178,7 +2230,7 @@ _SPARK_MODES: list[SparkMode] = [
             "Persistent occupation of one cluster with rare transitions indicates "
             "metastability; rapid switching indicates good conformational sampling."
         ),
-        get_data=lambda S, _: ([], []), get_ref=lambda *_: None,
+        get_data=lambda state, _: ([], []), get_ref=lambda *_: None,
         needs_atoms=True, raster_fn=_raster_cluster_trajectory, poll=_poll_cluster,
     ),
 ]
@@ -2189,123 +2241,123 @@ _HISTORY_CHUNK = 2000  # iterations per yield in _history_scan_gen
 
 def _history_scan_gen(
     reader: SimulationReader,
-    S: types.SimpleNamespace,
+    state: MonitorState,
 ) -> Generator[None, None, None]:
     """Incrementally accumulate exchange / energy / volume history.
 
     Processes iterations in chunks of ``_HISTORY_CHUNK``, yielding after each
     so the main loop can render progress and check the deadline.  Advances
-    ``S.last_mixed_iter`` as it goes so ``_poll`` sees consistent state.
-    Clears ``S.history_computing`` on exit.
+    ``state.last_mixed_iter`` as it goes so ``_poll`` sees consistent state.
+    Clears ``state.history_computing`` on exit.
     """
     t_scan_start = time.perf_counter()
     n_chunks = 0
     n_tkin_reads = 0
     _LOG.debug(
         "history scan start: display_iter=%d last_mixed=%d chunk_size=%d",
-        S.display_iter, S.last_mixed_iter, _HISTORY_CHUNK,
+        state.display_iter, state.last_mixed_iter, _HISTORY_CHUNK,
     )
     try:
-        while S.last_mixed_iter < S.display_iter:
-            chunk_start = S.last_mixed_iter + 1
-            chunk_end   = min(chunk_start + _HISTORY_CHUNK, S.display_iter + 1)
+        while state.last_mixed_iter < state.display_iter:
+            chunk_start = state.last_mixed_iter + 1
+            chunk_end   = min(chunk_start + _HISTORY_CHUNK, state.display_iter + 1)
             chunk       = slice(chunk_start, chunk_end)
             t0 = time.perf_counter()
             try:
                 t1 = time.perf_counter()
                 acc_delta, prop_delta = reader.exchange_counts(chunk)
-                S.acc_sum  += acc_delta
-                S.prop_sum += prop_delta
+                state.acc_sum  += acc_delta
+                state.prop_sum += prop_delta
                 t2 = time.perf_counter()
                 new_states_arr   = reader.states_range(chunk)
                 t3 = time.perf_counter()
                 new_energies_arr = reader.energies_range(chunk)
                 t4 = time.perf_counter()
-                new_volumes_ma   = reader.volumes_range(chunk) if S.has_volume else None
+                new_volumes_ma   = reader.volumes_range(chunk) if state.has_volume else None
                 t5 = time.perf_counter()
                 _LOG.debug(
                     "chunk %d–%d (n=%d): exchange=%.1fms states=%.1fms energies=%.1fms volumes=%.1fms",
                     chunk_start, chunk_end - 1, chunk_end - chunk_start,
                     (t2 - t1) * 1e3, (t3 - t2) * 1e3, (t4 - t3) * 1e3, (t5 - t4) * 1e3,
                 )
-                for r in range(S.n_replicas):
-                    S.state_counts[r] += np.bincount(
-                        new_states_arr[:, r], minlength=S.n_states
+                for r in range(state.n_replicas):
+                    state.state_counts[r] += np.bincount(
+                        new_states_arr[:, r], minlength=state.n_states
                     )
                 abs_iters_arr = np.arange(chunk_start, chunk_end)
-                n_states_m1   = S.n_states - 1
+                n_states_m1   = state.n_states - 1
 
                 # Volume cache: last valid value per replica in this chunk.
                 if new_volumes_ma is not None:
-                    for r in range(S.n_replicas):
+                    for r in range(state.n_replicas):
                         col   = new_volumes_ma[:, r]
                         valid = ~np.ma.getmaskarray(col) & np.isfinite(col.data) & (col.data > 0)
                         if valid.any():
                             last_idx           = int(np.where(valid)[0][-1])
-                            S.cached_vol[r]    = f"{float(col.data[last_idx]):.2f}"
-                            S.cached_vol_at[r] = chunk_start + last_idx + 1
+                            state.cached_vol[r]    = f"{float(col.data[last_idx]):.2f}"
+                            state.cached_vol_at[r] = chunk_start + last_idx + 1
 
                 # T_kin: read velocity arrays at vel_interval boundaries in chunk.
-                if S.has_t_kin and S.vel_interval > 0:
+                if state.has_t_kin and state.vel_interval > 0:
                     first_bdry = (
-                        (chunk_start + S.vel_interval - 1) // S.vel_interval
-                    ) * S.vel_interval
-                    for tkin_iter in range(first_bdry, chunk_end, S.vel_interval):
+                        (chunk_start + state.vel_interval - 1) // state.vel_interval
+                    ) * state.vel_interval
+                    for tkin_iter in range(first_bdry, chunk_end, state.vel_interval):
                         t_tkin = time.perf_counter()
-                        for r in range(S.n_replicas):
+                        for r in range(state.n_replicas):
                             t = reader.t_kin(tkin_iter, r)
                             if t is not None:
-                                S.cached_t_kin[r]    = f"{t:.1f}"
-                                S.cached_t_kin_at[r] = tkin_iter + 1
+                                state.cached_t_kin[r]    = f"{t:.1f}"
+                                state.cached_t_kin_at[r] = tkin_iter + 1
                         n_tkin_reads += 1
                         _LOG.debug(
                             "  t_kin iter %d: %.1fms (%d replicas)",
-                            tkin_iter, (time.perf_counter() - t_tkin) * 1e3, S.n_replicas,
+                            tkin_iter, (time.perf_counter() - t_tkin) * 1e3, state.n_replicas,
                         )
 
                 # Half-trips and ground-state sparkline data: vectorised per replica.
-                for r in range(S.n_replicas):
+                for r in range(state.n_replicas):
                     states_r = new_states_arr[:, r]
 
                     # Extreme-state transitions → half-trips.
                     extreme_idxs = np.where((states_r == 0) | (states_r == n_states_m1))[0]
                     if extreme_idxs.size > 0:
                         ext_states = states_r[extreme_idxs]
-                        if S.last_extreme[r] is not None:
+                        if state.last_extreme[r] is not None:
                             chain    = np.empty(ext_states.size + 1, dtype=ext_states.dtype)
-                            chain[0] = S.last_extreme[r]
+                            chain[0] = state.last_extreme[r]
                             chain[1:] = ext_states
                         else:
                             chain = ext_states
-                        S.half_trips[r]   += int(np.count_nonzero(np.diff(chain)))
-                        S.last_extreme[r]  = int(ext_states[-1])
+                        state.half_trips[r]   += int(np.count_nonzero(np.diff(chain)))
+                        state.last_extreme[r]  = int(ext_states[-1])
 
                     # Ground-state rows: batch-append energies and volumes.
                     gs_idxs = np.where(states_r == 0)[0]
                     if gs_idxs.size > 0:
                         gs_abs = abs_iters_arr[gs_idxs]
-                        gs_u   = new_energies_arr[gs_idxs, r, 0] * S.kt_kjmol
-                        S.ground_u_history.extend(gs_u.tolist())
-                        S.ground_u_iters.extend(gs_abs.tolist())
+                        gs_u   = new_energies_arr[gs_idxs, r, 0] * state.kt_kjmol
+                        state.ground_u_history.extend(gs_u.tolist())
+                        state.ground_u_iters.extend(gs_abs.tolist())
                         if new_volumes_ma is not None:
                             gs_vols = np.ma.filled(new_volumes_ma[gs_idxs, r], np.nan)
                             valid_v = np.isfinite(gs_vols) & (gs_vols > 0)
                             if valid_v.any():
-                                S.ground_vol_history.extend(gs_vols[valid_v].tolist())
-                                S.ground_vol_iters.extend(gs_abs[valid_v].tolist())
-                S.last_mixed_iter = chunk_end - 1
-                S.scrub_checkpoints.append((
-                    S.last_mixed_iter,
-                    S.state_counts.copy(),
-                    S.half_trips.copy(),
-                    list(S.last_extreme),
-                    S.acc_sum.copy(),
-                    S.prop_sum.copy(),
+                                state.ground_vol_history.extend(gs_vols[valid_v].tolist())
+                                state.ground_vol_iters.extend(gs_abs[valid_v].tolist())
+                state.last_mixed_iter = chunk_end - 1
+                state.scrub_checkpoints.append((
+                    state.last_mixed_iter,
+                    state.state_counts.copy(),
+                    state.half_trips.copy(),
+                    list(state.last_extreme),
+                    state.acc_sum.copy(),
+                    state.prop_sum.copy(),
                 ))
                 n_chunks += 1
                 _LOG.debug(
                     "chunk total: %.1fms  (last_mixed=%d)",
-                    (time.perf_counter() - t0) * 1e3, S.last_mixed_iter,
+                    (time.perf_counter() - t0) * 1e3, state.last_mixed_iter,
                 )
             except (OSError, IndexError, RuntimeError):
                 _LOG.exception("history scan error at chunk %d–%d", chunk_start, chunk_end - 1)
@@ -2315,91 +2367,92 @@ def _history_scan_gen(
         elapsed = time.perf_counter() - t_scan_start
         _LOG.info(
             "history scan done: %d iters in %d chunks, %d t_kin reads, total %.3fs",
-            S.last_mixed_iter + 1, n_chunks, n_tkin_reads, elapsed,
+            state.last_mixed_iter + 1, n_chunks, n_tkin_reads, elapsed,
         )
-        S.history_computing = False
-        S.history_bulk_loading = False
+        state.history_computing = False
+        state.history_bulk_loading = False
 
 
 def _rmsd_gen(
     reader: SimulationReader,
-    S: types.SimpleNamespace,
+    state: MonitorState,
 ) -> Generator[None, None, None]:
     """Incrementally load position frames and compute pairwise RMSD.
 
     Yields after each frame so ``TaskRunner`` can interleave with other tasks
-    and respect the loop deadline.  Clears ``S.rmsd_computing`` on exit.
+    and respect the loop deadline.  Clears ``state.rmsd_computing`` on exit.
     """
     try:
         while (
-            not S.waiting
-            and S.solute_atom_sel is not None
-            and S.pos_interval > 0
-            and S.pos_scan_iter <= S.display_iter
+            not state.waiting
+            and state.solute_atom_sel is not None
+            and state.pos_interval > 0
+            and state.pos_scan_iter <= state.display_iter
         ):
-            abs_i = S.pos_scan_iter
-            S.pos_scan_iter += S.pos_interval   # advance before any early-out
+            abs_i = state.pos_scan_iter
+            state.pos_scan_iter += state.pos_interval   # advance before any early-out
             try:
                 step  = reader.replica_states(abs_i)
                 r_pos = int(np.where(step == 0)[0][0])
-                pos   = reader.positions(abs_i, r_pos, S.solute_atom_sel)
+                pos   = reader.positions(abs_i, r_pos, state.solute_atom_sel)
                 if pos is not None:
                     new_row = [
-                        _kabsch_rmsd(pos, S.pos_all_frames[j]) * 10.0
-                        for j in range(len(S.pos_all_frames))
+                        _kabsch_rmsd(pos, state.pos_all_frames[j]) * 10.0
+                        for j in range(len(state.pos_all_frames))
                     ]
-                    S.pairwise_rmsd_mat.append(new_row)
-                    S.pos_all_frames.append(pos)
-                    S.pos_frame_iters.append(abs_i)
-                    S.n_pos_frames = len(S.pos_all_frames)
+                    state.pairwise_rmsd_mat.append(new_row)
+                    state.pos_all_frames.append(pos)
+                    state.pos_frame_iters.append(abs_i)
+                    state.pos_frame_replicas.append(r_pos)
+                    state.n_pos_frames = len(state.pos_all_frames)
             except (OSError, IndexError, RuntimeError, np.linalg.LinAlgError):
                 _LOG.debug("skipping RMSD frame at iter %d", abs_i, exc_info=True)
             yield
     finally:
-        S.rmsd_computing = False
+        state.rmsd_computing = False
 
 
 def _state0_scan_gen(
     reader: SimulationReader,
-    S: types.SimpleNamespace,
+    state: MonitorState,
 ) -> Generator[None, None, None]:
     """Bulk-read replica_states for all unseen iterations in one NetCDF slice.
 
     Reading states[:, :] as a single 2-D array is orders of magnitude faster
     than one replica_states() call per iteration.  Yields after the read and
     after the numpy extraction so the render loop stays live.  Clears
-    S.state0_scanning on exit.
+    state.state0_scanning on exit.
     """
     try:
-        start = S.state0_scan_iter
-        end   = S.display_iter + 1
+        start = state.state0_scan_iter
+        end   = state.display_iter + 1
         if start >= end:
             return
         states = reader.replica_states_range(start, end)   # (n_iters, n_replicas)
         yield
         # For each iteration, argmax on the boolean mask gives the replica in state 0.
         replica_at_state0 = (states == 0).argmax(axis=1)   # (n_iters,)
-        S.state0_replica_iters.extend(range(start, end))
-        S.state0_replica_vals.extend(replica_at_state0.tolist())
-        S.state0_scan_iter = end
+        state.state0_replica_iters.extend(range(start, end))
+        state.state0_replica_vals.extend(replica_at_state0.tolist())
+        state.state0_scan_iter = end
         yield
     finally:
-        S.state0_scanning = False
+        state.state0_scanning = False
 
 
 
-def _fetch_scrub_data(reader: SimulationReader, S: types.SimpleNamespace) -> None:
+def _fetch_scrub_data(reader: SimulationReader, state: MonitorState) -> None:
     """Read/compute all per-iteration data for the pinned scrub position."""
-    si         = S.scrub_iter
-    n_replicas = S.n_replicas
-    n_states   = S.n_states
+    si         = state.scrub_iter
+    n_replicas = state.n_replicas
+    n_states   = state.n_states
 
-    S.scrub_states   = reader.replica_states(si)
-    S.scrub_energies = reader.energies(si)
+    state.scrub_states   = reader.replica_states(si)
+    state.scrub_energies = reader.energies(si)
 
     # State counts and half-trips: start from nearest chunk checkpoint then
     # apply the residual (at most one chunk worth) of raw states from the NC.
-    checkpoints = S.scrub_checkpoints
+    checkpoints = state.scrub_checkpoints
     if checkpoints:
         idx = bisect.bisect_right([c[0] for c in checkpoints], si) - 1
     else:
@@ -2437,98 +2490,98 @@ def _fetch_scrub_data(reader: SimulationReader, S: types.SimpleNamespace) -> Non
                          if last_extreme[r] is not None else ext_s)
                 half_trips[r] += int(np.count_nonzero(np.diff(chain)))
 
-    S.scrub_acc_sum      = acc_sum
-    S.scrub_prop_sum     = prop_sum
-    S.scrub_state_counts = state_counts
-    S.scrub_half_trips   = np.array(half_trips, dtype=int)
+    state.scrub_acc_sum      = acc_sum
+    state.scrub_prop_sum     = prop_sum
+    state.scrub_state_counts = state_counts
+    state.scrub_half_trips   = np.array(half_trips, dtype=int)
 
     # T_kin at scrub position (nearest vel_interval boundary)
     scrub_t_kin    = ["—"] * n_replicas
     scrub_t_kin_at = [si + 1] * n_replicas  # default: current frame (no asterisk)
-    if S.has_t_kin:
+    if state.has_t_kin:
         for r in range(n_replicas):
             t_at = si
             t    = reader.t_kin(si, r)
-            if t is None and S.vel_interval > 0:
-                t_at = (si // S.vel_interval) * S.vel_interval
+            if t is None and state.vel_interval > 0:
+                t_at = (si // state.vel_interval) * state.vel_interval
                 t    = reader.t_kin(t_at, r)
             if t is not None:
                 scrub_t_kin[r]    = f"{t:.1f}"
                 scrub_t_kin_at[r] = t_at + 1
-    S.scrub_t_kin    = scrub_t_kin
-    S.scrub_t_kin_at = scrub_t_kin_at
+    state.scrub_t_kin    = scrub_t_kin
+    state.scrub_t_kin_at = scrub_t_kin_at
 
     # Volume at nearest pos_interval boundary (volume not written every iteration)
     scrub_vol    = ["—"] * n_replicas
     scrub_vol_at = [si + 1] * n_replicas  # default: current frame (no asterisk)
-    if S.has_volume and S.pos_interval > 0:
-        v_at = (si // S.pos_interval) * S.pos_interval
+    if state.has_volume and state.pos_interval > 0:
+        v_at = (si // state.pos_interval) * state.pos_interval
         for r in range(n_replicas):
             v = reader.volume(v_at, r)
             if v is not None:
                 scrub_vol[r]    = f"{v:.2f}"
                 scrub_vol_at[r] = v_at + 1
-    S.scrub_vol    = scrub_vol
-    S.scrub_vol_at = scrub_vol_at
+    state.scrub_vol    = scrub_vol
+    state.scrub_vol_at = scrub_vol_at
 
 
-def _poll(reader: SimulationReader, S: types.SimpleNamespace, stdscr: curses.window) -> bool:
-    """Read fresh data via *reader* and update S. Returns True if a redraw is needed."""
+def _poll(reader: SimulationReader, state: MonitorState, stdscr: curses.window) -> bool:
+    """Read fresh data via *reader* and update state. Returns True if a redraw is needed."""
     last_iter     = reader.last_iteration()
-    S.ever_polled = True
+    state.ever_polled = True
 
     if last_iter == -1:
-        S.waiting = True
+        state.waiting = True
         return True  # always redraw so the "no data" spinner animates
 
-    S.waiting = False
+    state.waiting = False
 
-    if last_iter == S.prev_iter:
+    if last_iter == state.prev_iter:
         return False  # no new data
 
-    S.prev_iter = last_iter
+    state.prev_iter = last_iter
     if last_iter == 0:
         return False
 
     display_iter = last_iter - 1
-    S.display_iter = display_iter
+    state.display_iter = display_iter
 
     # History accumulation (exchange counts, ground-state energies/volumes,
     # half-trips) is handled incrementally by _history_scan_gen so that a large
     # finished simulation doesn't block the UI on the first poll.
     try:
-        S.replica_states = reader.replica_states(display_iter)
-        S.energies       = reader.energies(display_iter)
+        state.replica_states = reader.replica_states(display_iter)
+        state.energies       = reader.energies(display_iter)
     except (OSError, IndexError, RuntimeError):
-        S.prev_iter = last_iter - 1  # retry this iteration
+        state.prev_iter = last_iter - 1  # retry this iteration
         return False
     except Exception:
         import traceback
-        S.error_text = traceback.format_exc()
+        state.error_text = traceback.format_exc()
         return True
 
-    S.error_text = ""
+    state.error_text = ""
 
     # Format timing strings
-    sim_ps = (display_iter + 1) * S.n_steps * S.timestep_ps
-    S.sim_str = f"{sim_ps / 1000:.3f} ns" if sim_ps >= 1000 else f"{sim_ps:.1f} ps"
-    if S.n_iterations:
-        total_sim_ps  = S.n_iterations * S.n_steps * S.timestep_ps
+    sim_ps = (display_iter + 1) * state.n_steps * state.timestep_ps
+    state.sim_str = f"{sim_ps / 1000:.3f} ns" if sim_ps >= 1000 else f"{sim_ps:.1f} ps"
+    if state.n_iterations:
+        total_sim_ps  = state.n_iterations * state.n_steps * state.timestep_ps
         total_sim_str = (
             f"{total_sim_ps / 1000:.1f} ns" if total_sim_ps >= 1000
             else f"{total_sim_ps:.1f} ps"
         )
-        S.sim_str = f"{S.sim_str} / {total_sim_str}"
-    S.iter_str = f"{display_iter + 1}" + (f" / {S.n_iterations}" if S.n_iterations else "")
+        state.sim_str = f"{state.sim_str} / {total_sim_str}"
+    state.iter_str = f"{display_iter + 1}" + (f" / {state.n_iterations}" if state.n_iterations else "")
 
-    S.timing_str = ""
+    state.timing_str = ""
     try:
         ts0   = reader.timestamp(0)
         tsnow = reader.timestamp(display_iter)
         if ts0 is not None and tsnow is not None:
             elapsed_s = tsnow - ts0
-            S.timing_str = f"    Elapsed: {_fmt_duration(elapsed_s)}"
-            if S.n_iterations and display_iter > 0:
+            state.timing_str = f"    Elapsed: {_fmt_duration(elapsed_s)}"
+            if state.n_iterations and display_iter > 0:
                 window       = max(50, display_iter // 20)
                 window_start = max(0, display_iter - window)
                 ts_window    = reader.timestamp(window_start)
@@ -2539,9 +2592,9 @@ def _poll(reader: SimulationReader, S: types.SimpleNamespace, stdscr: curses.win
                         window_iters / window_elapsed if window_elapsed > 0
                         else display_iter / elapsed_s
                     )
-                    remaining_s = (S.n_iterations - display_iter - 1) / rate
+                    remaining_s = (state.n_iterations - display_iter - 1) / rate
                     eta = datetime.fromtimestamp(tsnow + remaining_s)
-                    S.timing_str += (
+                    state.timing_str += (
                         f"    ETA: {eta.strftime('%Y-%m-%d %H:%M')}"
                         f" (~{_fmt_duration(remaining_s)} remaining)"
                     )
@@ -2553,34 +2606,34 @@ def _poll(reader: SimulationReader, S: types.SimpleNamespace, stdscr: curses.win
     # Only read T_kin / Volume once history has fully caught up — using the data
     # state (last_mixed_iter) rather than the task flag so we don't race with
     # the task submission that happens after _poll in the main loop.
-    if S.last_mixed_iter >= display_iter:
-        for r in range(S.n_replicas):
-            if S.has_t_kin:
+    if state.last_mixed_iter >= display_iter:
+        for r in range(state.n_replicas):
+            if state.has_t_kin:
                 t_iter = display_iter
                 t = reader.t_kin(t_iter, r)
-                if t is None and S.vel_interval > 0:
+                if t is None and state.vel_interval > 0:
                     # display_iter may not be a velocity-write boundary; try nearest one
-                    t_iter = (display_iter // S.vel_interval) * S.vel_interval
+                    t_iter = (display_iter // state.vel_interval) * state.vel_interval
                     t = reader.t_kin(t_iter, r)
                 if t is not None:
-                    S.cached_t_kin[r]    = f"{t:.1f}"
-                    S.cached_t_kin_at[r] = t_iter + 1
-            if S.has_volume:
+                    state.cached_t_kin[r]    = f"{t:.1f}"
+                    state.cached_t_kin_at[r] = t_iter + 1
+            if state.has_volume:
                 v = reader.volume(display_iter, r)
                 if v is not None:
-                    S.cached_vol[r]    = f"{v:.2f}"
-                    S.cached_vol_at[r] = display_iter + 1
+                    state.cached_vol[r]    = f"{v:.2f}"
+                    state.cached_vol_at[r] = display_iter + 1
 
     # Online ΔF
     fe_result = reader.free_energy_history(display_iter)
     if fe_result is not None:
-        S.fe_iters = [i for i, _ in fe_result]
-        S.fe_vals  = [fv for _, fv in fe_result]
+        state.fe_iters = [i for i, _ in fe_result]
+        state.fe_vals  = [fv for _, fv in fe_result]
 
     return True
 
 
-def _render_topology(stdscr: curses.window, S: types.SimpleNamespace) -> None:
+def _render_topology(stdscr: curses.window, state: MonitorState) -> None:
     """Render the topology molecule table in place of the exchange matrix.
 
     Spills into a second (or third…) column when the row count would exceed the
@@ -2588,7 +2641,7 @@ def _render_topology(stdscr: curses.window, S: types.SimpleNamespace) -> None:
     """
     from itertools import groupby
 
-    mols: list[tuple[str, list[int]]] = getattr(S, "topology_molecules", [])
+    mols = state.topology_molecules
     n_total = sum(len(m[1]) for m in mols)
 
     _addstr(stdscr, f"  Topology  {n_total:,} atoms  (0-indexed, copy ranges verbatim)\n\n")
@@ -2650,23 +2703,23 @@ def _render_topology(stdscr: curses.window, S: types.SimpleNamespace) -> None:
     _addstr(stdscr, "\n")
 
 
-def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int] | None) -> None:
-    """Redraw the entire screen from S. Pure display, no nc access."""
+def _render(stdscr: curses.window, state: MonitorState, gradient: list[int] | None) -> None:
+    """Redraw the entire screen from state. Pure display, no nc access."""
     stdscr.erase()
 
-    _addstr(stdscr, f"{S.title}\n", curses.A_BOLD)
+    _addstr(stdscr, f"{state.title}\n", curses.A_BOLD)
 
-    if S.error_text:
-        _addstr(stdscr, f"Unexpected error:\n{S.error_text}")
+    if state.error_text:
+        _addstr(stdscr, f"Unexpected error:\n{state.error_text}")
         stdscr.refresh()
         return
 
-    if S.waiting:
+    if state.waiting:
         wall     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         spin_ch  = _SPINNER[int(time.monotonic() * 4) % len(_SPINNER)]
         _addstr(stdscr, f"  Wall: {wall}\n\n")
-        if not S.ever_polled:
+        if not state.ever_polled:
             _addstr(stdscr, f"  {spin_ch}  Reading...", curses.color_pair(_CP_YELLOW))
         else:
             _addstr(stdscr,
@@ -2675,59 +2728,59 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
         stdscr.refresh()
         return
 
-    if S.replica_states is None:
+    if state.replica_states is None:
         stdscr.refresh()
         return
 
-    n_replicas   = S.n_replicas
-    n_states     = S.n_states
-    display_iter = S.display_iter
+    n_replicas   = state.n_replicas
+    n_states     = state.n_states
+    display_iter = state.display_iter
 
     # Scrub mode: override which per-iteration data is shown
-    _scrubbing        = S.scrub_iter is not None and S.scrub_states is not None
-    _render_states    = S.scrub_states       if _scrubbing else S.replica_states
-    _render_energies  = S.scrub_energies     if _scrubbing else S.energies
-    _render_scounts   = S.scrub_state_counts if _scrubbing else S.state_counts
-    _render_htrips    = S.scrub_half_trips   if _scrubbing else S.half_trips
-    _render_t_kin     = S.scrub_t_kin        if _scrubbing else S.cached_t_kin
-    _render_vol       = S.scrub_vol          if _scrubbing else S.cached_vol
+    _scrubbing        = state.scrub_iter is not None and state.scrub_states is not None
+    _render_states    = state.scrub_states       if _scrubbing else state.replica_states
+    _render_energies  = state.scrub_energies     if _scrubbing else state.energies
+    _render_scounts   = state.scrub_state_counts if _scrubbing else state.state_counts
+    _render_htrips    = state.scrub_half_trips   if _scrubbing else state.half_trips
+    _render_t_kin     = state.scrub_t_kin        if _scrubbing else state.cached_t_kin
+    _render_vol       = state.scrub_vol          if _scrubbing else state.cached_vol
 
     # While history is loading, show the scan cursor rather than the final iter.
-    if S.history_computing and S.last_mixed_iter >= 0:
-        _cur = S.last_mixed_iter + 1
-        _tot = S.n_iterations or (S.display_iter + 1)
+    if state.history_computing and state.last_mixed_iter >= 0:
+        _cur = state.last_mixed_iter + 1
+        _tot = state.n_iterations or (state.display_iter + 1)
         _iter_str = f"{_cur} / {_tot}"
-        _sim_ps   = _cur * S.n_steps * S.timestep_ps
+        _sim_ps   = _cur * state.n_steps * state.timestep_ps
         _sim_str  = f"{_sim_ps / 1000:.3f} ns" if _sim_ps >= 1000 else f"{_sim_ps:.1f} ps"
-        if S.n_iterations:
-            _total_ps = S.n_iterations * S.n_steps * S.timestep_ps
+        if state.n_iterations:
+            _total_ps = state.n_iterations * state.n_steps * state.timestep_ps
             _total_str = f"{_total_ps / 1000:.1f} ns" if _total_ps >= 1000 else f"{_total_ps:.1f} ps"
             _sim_str = f"{_sim_str} / {_total_str}"
     elif _scrubbing:
-        _si   = S.scrub_iter
-        _tot  = S.n_iterations or (display_iter + 1)
+        _si   = state.scrub_iter
+        _tot  = state.n_iterations or (display_iter + 1)
         _iter_str = f"[{_si + 1}] / {_tot}"
-        _sim_ps   = (_si + 1) * S.n_steps * S.timestep_ps
+        _sim_ps   = (_si + 1) * state.n_steps * state.timestep_ps
         _sim_str  = f"[{_sim_ps / 1000:.3f} ns]" if _sim_ps >= 1000 else f"[{_sim_ps:.1f} ps]"
-        if S.n_iterations:
-            _total_ps  = S.n_iterations * S.n_steps * S.timestep_ps
+        if state.n_iterations:
+            _total_ps  = state.n_iterations * state.n_steps * state.timestep_ps
             _total_str = f"{_total_ps / 1000:.1f} ns" if _total_ps >= 1000 else f"{_total_ps:.1f} ps"
             _sim_str   = f"{_sim_str} / {_total_str}"
     else:
-        _iter_str = S.iter_str
-        _sim_str  = S.sim_str
-    _addstr(stdscr, f"  Iteration: {_iter_str}    Time: {_sim_str}{S.timing_str}\n\n")
+        _iter_str = state.iter_str
+        _sim_str  = state.sim_str
+    _addstr(stdscr, f"  Iteration: {_iter_str}    Time: {_sim_str}{state.timing_str}\n\n")
 
-    if S.rmsd_input_active:
-        _render_topology(stdscr, S)
+    if state.rmsd_input_active:
+        _render_topology(stdscr, state)
         # Draw input bar at the last row and refresh, then skip the matrix body.
         _term_rows, _term_cols = stdscr.getmaxyx()
         _hints     = "   Enter confirm   Esc cancel"
         _prefix    = "  Atom selection: "
-        _input_str = S.rmsd_input_buf + "\u2588"
-        _err_str   = f"  ✗ {S.rmsd_sel_error}" if S.rmsd_sel_error else ""
+        _input_str = state.rmsd_input_buf + "\u2588"
+        _err_str   = f"  ✗ {state.rmsd_sel_error}" if state.rmsd_sel_error else ""
         _lhs       = _prefix + _input_str
-        _mid       = ("  e.g. 0-64,67,200-300" if not S.rmsd_sel_error else "")
+        _mid       = ("  e.g. 0-64,67,200-300" if not state.rmsd_sel_error else "")
         _rhs       = _mid + _err_str + _hints
         gap        = max(1, _term_cols - 1 - len(_lhs) - len(_rhs))
         bar        = (_lhs + " " * gap + _rhs).ljust(_term_cols - 1)
@@ -2736,7 +2789,7 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
             stdscr.addstr(bar, curses.A_REVERSE)
         except curses.error:
             pass
-        if S.rmsd_sel_error:
+        if state.rmsd_sel_error:
             _err_attr = curses.color_pair(_CP_RED) | curses.A_BOLD | curses.A_REVERSE
             try:
                 stdscr.move(_term_rows - 1, len(_prefix))
@@ -2754,21 +2807,21 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
     matrix_w = 2 + 5 + n_states * col_w
     sep      = "   "
 
-    total_iters = (S.n_iterations - 1) if S.n_iterations else (display_iter + 1)
+    total_iters = (state.n_iterations - 1) if state.n_iterations else (display_iter + 1)
     _term_rows, _term_cols = stdscr.getmaxyx()
     spark_w = max(10, _term_cols - matrix_w - len(sep) - 1)
 
     # Derive sparkline data, reference line, and axis labels from the mode registry
-    mode = S.sparkline_mode
+    mode = state.sparkline_mode
     m    = _SPARK_MODES[mode]
 
-    sp_iters, sp_vals = m.get_data(S, spark_w)
-    sp_ref_val        = m.get_ref(S, sp_vals)
+    sp_iters, sp_vals = m.get_data(state, spark_w)
+    sp_ref_val        = m.get_ref(state, sp_vals)
 
     # x-axis labels and grid_total (must precede n_per_unit which uses grid_total)
-    total_ns = total_iters * S.n_steps * S.timestep_ps / 1000
+    total_ns = total_iters * state.n_steps * state.timestep_ps / 1000
     if m.get_grid is not None:
-        grid_total, xaxis_l, xaxis_r = m.get_grid(S, sp_iters, total_iters)
+        grid_total, xaxis_l, xaxis_r = m.get_grid(state, sp_iters, total_iters)
     else:
         grid_total = total_iters
         xaxis_l = "0 ns"
@@ -2787,7 +2840,7 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
             if _filled > 0:
                 n_per_unit = len(sp_vals) / _filled
         if m.xaxis_m_fn is not None:
-            xaxis_m = m.xaxis_m_fn(S)
+            xaxis_m = m.xaxis_m_fn(state)
         elif n_per_unit is not None and n_per_unit > _SPARK_DOTS_THRESHOLD:
             xaxis_m = f"~{_fmt_2sf(n_per_unit)}/dot"
 
@@ -2796,47 +2849,47 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
 
     if m.raster_fn is not None:
         has_256 = gradient is not None
-        spark_grid = m.raster_fn(S, spark_w, n_states, total_iters, has_256)
+        spark_grid = m.raster_fn(state, spark_w, n_states, total_iters, has_256)
         spark_ymin = spark_ymax = float("nan")  # unused for raster
-        if m.needs_atoms and S.solute_atom_sel is None:
+        if m.needs_atoms and state.solute_atom_sel is None:
             spark_title = f"{sp_prefix}  (press 'a' to set atom selection)"
         elif m.poll is None:
             # No background computation — replica scatter just shows what we have
             spark_title = (
-                f"{sp_prefix}  {S.n_pos_frames} frames"
-                if S.pos_frame_replicas else f"{sp_prefix}  (accumulating...)"
+                f"{sp_prefix}  {state.n_pos_frames} frames"
+                if state.pos_frame_replicas else f"{sp_prefix}  (accumulating...)"
             )
-        elif S.k_choosing:
-            spark_title = f"{sp_prefix}  (choosing k…  {S.n_pos_frames} frames)"
-        elif S.cluster_computing:
-            spark_title = f"{sp_prefix}  k={S.cluster_k}  (clustering…)"
-        elif S.cluster_labels:
-            n_outliers = sum(S.cluster_outlier_mask) if S.cluster_outlier_mask else 0
+        elif state.k_choosing:
+            spark_title = f"{sp_prefix}  (choosing k…  {state.n_pos_frames} frames)"
+        elif state.cluster_computing:
+            spark_title = f"{sp_prefix}  k={state.cluster_k}  (clustering…)"
+        elif state.cluster_labels:
+            n_outliers = sum(state.cluster_outlier_mask) if state.cluster_outlier_mask else 0
             outlier_str = f"  {n_outliers} outliers" if n_outliers else ""
-            if S.cluster_intercluster_dists and S.cluster_k and S.cluster_k > 1:
-                mat = np.array(S.cluster_intercluster_dists)
-                upper = mat[np.triu_indices(S.cluster_k, k=1)]
+            if state.cluster_intercluster_dists and state.cluster_k and state.cluster_k > 1:
+                mat = np.array(state.cluster_intercluster_dists)
+                upper = mat[np.triu_indices(state.cluster_k, k=1)]
                 d_min, d_max = float(upper.min()), float(upper.max())
                 dist_str = f"  d={d_min:.1f}–{d_max:.1f}Å"
             else:
                 dist_str = ""
             spark_title = (
-                f"{sp_prefix}  k={S.cluster_k}{dist_str}"
-                f"  {len(S.cluster_labels)} frames{outlier_str}"
+                f"{sp_prefix}  k={state.cluster_k}{dist_str}"
+                f"  {len(state.cluster_labels)} frames{outlier_str}"
             )
-        elif S.n_pos_frames < _K_MIN_FRAMES:
-            spark_title = f"{sp_prefix}  (need {_K_MIN_FRAMES} frames, have {S.n_pos_frames})"
+        elif state.n_pos_frames < _K_MIN_FRAMES:
+            spark_title = f"{sp_prefix}  (need {_K_MIN_FRAMES} frames, have {state.n_pos_frames})"
         else:
             spark_title = f"{sp_prefix}  (accumulating...)"
         # Scrub cursor on raster — same logic as sparkline
         if _scrubbing and grid_total > 0:
-            cur_col  = max(0, min(spark_w - 1, int(S.scrub_iter / grid_total * spark_w)))
+            cur_col  = max(0, min(spark_w - 1, int(state.scrub_iter / grid_total * spark_w)))
             cur_attr = curses.color_pair(_CP_BLUE)
             for r in range(n_states):
                 if spark_grid[r][cur_col][0] == " ":
                     spark_grid[r][cur_col] = ("│", cur_attr)
     else:
-        _yfix = m.y_fixed_range(S) if m.y_fixed_range is not None else (None, None)
+        _yfix = m.y_fixed_range(state) if m.y_fixed_range is not None else (None, None)
         spark_grid, spark_ymin, spark_ymax = _build_sparkline_grid(
             sp_iters, sp_vals,
             grid_total, n_states, spark_w,
@@ -2851,27 +2904,27 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
         )
         # Scrub cursor: blue vertical bar only on empty cells (never overwrites data)
         if _scrubbing and not m.individual_dots and grid_total > 0:
-            cur_col  = max(0, min(spark_w - 1, int(S.scrub_iter / grid_total * spark_w)))
+            cur_col  = max(0, min(spark_w - 1, int(state.scrub_iter / grid_total * spark_w)))
             cur_attr = curses.color_pair(_CP_BLUE)
             for r in range(n_states):
                 if spark_grid[r][cur_col][0] == " ":
                     spark_grid[r][cur_col] = ("│", cur_attr)
-        if m.needs_atoms and S.solute_atom_sel is None:
+        if m.needs_atoms and state.solute_atom_sel is None:
             spark_title = f"{sp_prefix}  (press 'a' to set atom selection)"
         elif m.needs_atoms:
-            n_frames_total = display_iter // S.pos_interval + 1
-            if S.n_pos_frames < n_frames_total:
-                pct = S.n_pos_frames / n_frames_total * 100
+            n_frames_total = display_iter // state.pos_interval + 1
+            if state.n_pos_frames < n_frames_total:
+                pct = state.n_pos_frames / n_frames_total * 100
                 spark_title = (
                     f"{sp_prefix}  (computing... {pct:.0f}%"
-                    f"  {S.n_pos_frames}/{n_frames_total} frames)"
+                    f"  {state.n_pos_frames}/{n_frames_total} frames)"
                 )
             elif sp_vals:
                 spark_title = f"{sp_prefix}  [{spark_ymin:.4g}, {spark_ymax:.4g}] {m.unit}"
             else:
                 spark_title = f"{sp_prefix}  (accumulating...)"
-        elif S.history_computing and m.uses_history and S.history_bulk_loading:
-            pct = (S.last_mixed_iter + 1) / (display_iter + 1) * 100
+        elif state.history_computing and m.uses_history and state.history_bulk_loading:
+            pct = (state.last_mixed_iter + 1) / (display_iter + 1) * 100
             spark_title = f"{sp_prefix}  (loading history... {pct:.0f}%)"
         elif sp_vals:
             spark_title = f"{sp_prefix}  [{spark_ymin:.4g}, {spark_ymax:.4g}] {m.unit}"
@@ -2905,8 +2958,8 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
     _addstr(stdscr, xaxis_r + "\n")
 
     # Data rows + sparkline rows (interleaved by state index)
-    _render_acc  = S.scrub_acc_sum  if _scrubbing else S.acc_sum
-    _render_prop = S.scrub_prop_sum if _scrubbing else S.prop_sum
+    _render_acc  = state.scrub_acc_sum  if _scrubbing else state.acc_sum
+    _render_prop = state.scrub_prop_sum if _scrubbing else state.prop_sum
     for i in range(n_states):
         _addstr(stdscr, f"  {i:>5}")
         for j in range(n_states):
@@ -2923,7 +2976,7 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
             _addstr(stdscr, char, attr)
         _addstr(stdscr, "\n")
 
-    if S.show_spark_help:
+    if state.show_spark_help:
         help_text = m.help_text
         if n_per_unit is not None and n_per_unit > _SPARK_DOTS_THRESHOLD:
             help_text += " Green dots are means; white dots are min/max range."
@@ -2939,13 +2992,13 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
 
     # Determine whether to show * in column headers / footnote.
     # * means "value is from a different iteration than the one being displayed".
-    _cur_iter_1 = (S.scrub_iter + 1) if _scrubbing else (display_iter + 1)
+    _cur_iter_1 = (state.scrub_iter + 1) if _scrubbing else (display_iter + 1)
     if _scrubbing:
-        _tkin_at_list = S.scrub_t_kin_at if S.scrub_t_kin_at is not None else []
-        _vol_at_list  = S.scrub_vol_at   if S.scrub_vol_at   is not None else []
+        _tkin_at_list = state.scrub_t_kin_at if state.scrub_t_kin_at is not None else []
+        _vol_at_list  = state.scrub_vol_at   if state.scrub_vol_at   is not None else []
     else:
-        _tkin_at_list = S.cached_t_kin_at
-        _vol_at_list  = S.cached_vol_at
+        _tkin_at_list = state.cached_t_kin_at
+        _vol_at_list  = state.cached_vol_at
     # iters where the value is stale (from a frame other than current)
     _tkin_stale_iters = sorted(set(at for at in _tkin_at_list if at >= 0 and at != _cur_iter_1))
     _vol_stale_iters  = sorted(set(at for at in _vol_at_list  if at >= 0 and at != _cur_iter_1))
@@ -2960,8 +3013,8 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
     _table_w   = 72 + visits_w
     _box_avail = _term_cols - 1 - _table_w   # chars available for the box
 
-    _iter_ps = S.n_steps * S.timestep_ps
-    _pos_ps  = S.pos_interval * S.n_steps * S.timestep_ps
+    _iter_ps = state.n_steps * state.timestep_ps
+    _pos_ps  = state.pos_interval * state.n_steps * state.timestep_ps
 
     def _fmt_ps(ps: float) -> str:
         return f"{_fmt_2sf(ps / 1000)} ns" if ps >= 1000 else f"{_fmt_2sf(ps)} ps"
@@ -2969,17 +3022,17 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
     _sim_info: list[tuple[str, str]] = [
         ("Replicas",    str(n_replicas)),
         ("States",      str(n_states)),
-        ("Ref. temp.",  f"{S.ref_temp_k:.4g} K"),
-        ("Timestep",    f"{S.timestep_ps:.4g} ps"),
-        ("Steps/iter",  f"{S.n_steps:,}"),
+        ("Ref. temp.",  f"{state.ref_temp_k:.4g} K"),
+        ("Timestep",    f"{state.timestep_ps:.4g} ps"),
+        ("Steps/iter",  f"{state.n_steps:,}"),
         ("Iter. time",  _fmt_ps(_iter_ps)),
     ]
-    if S.pos_interval > 0:
+    if state.pos_interval > 0:
         _sim_info.append(("Pos. every", _fmt_ps(_pos_ps)))
-    if S.vel_interval > 0:
-        _sim_info.append(("Vel. every", _fmt_ps(S.vel_interval * S.n_steps * S.timestep_ps)))
-    if S.n_atoms > 0:
-        _sim_info.append(("Atoms", f"{S.n_atoms:,}"))
+    if state.vel_interval > 0:
+        _sim_info.append(("Vel. every", _fmt_ps(state.vel_interval * state.n_steps * state.timestep_ps)))
+    if state.n_atoms > 0:
+        _sim_info.append(("Atoms", f"{state.n_atoms:,}"))
 
     _lbl_w    = max(len(lbl) for lbl, _ in _sim_info)
     _val_w    = max(len(val) for _, val in _sim_info)
@@ -3017,13 +3070,13 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
 
     for r in range(n_replicas):
         s = int(_render_states[r])
-        reduced_u_kjmol = float(_render_energies[r, s]) * S.kt_kjmol
-        _loading = not _scrubbing and S.last_mixed_iter < display_iter
-        if _loading and S.cached_t_kin_at[r] == -1:
+        reduced_u_kjmol = float(_render_energies[r, s]) * state.kt_kjmol
+        _loading = not _scrubbing and state.last_mixed_iter < display_iter
+        if _loading and state.cached_t_kin_at[r] == -1:
             t_kin_str = f"{_spin_ch:>10}"
         else:
             t_kin_str = f"{_render_t_kin[r]:>10}"
-        if _loading and S.cached_vol_at[r] == -1:
+        if _loading and state.cached_vol_at[r] == -1:
             vol_str = f"{_spin_ch:>13}"
         else:
             vol_str = f"{_render_vol[r]:>13}"
@@ -3060,8 +3113,8 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
                 pass  # terminal too narrow; skip remaining box lines
 
     _addstr(stdscr, "\n")
-    _rate_iter = S.scrub_iter if _scrubbing else display_iter
-    rate_ps    = (_rate_iter + 1) * S.n_steps * S.timestep_ps
+    _rate_iter = state.scrub_iter if _scrubbing else display_iter
+    rate_ps    = (_rate_iter + 1) * state.n_steps * state.timestep_ps
     if rate_ps > 0:
         rate_ns    = rate_ps / 1000
         trip_rates = [_render_htrips[r] // 2 / rate_ns for r in range(n_replicas)]
@@ -3093,22 +3146,22 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
     # Bottom key-binding bar (nano-style, always at last row)
     _term_rows, _term_cols = stdscr.getmaxyx()
     _prefix = _input_str = _hints = _err_str = ""  # set in rmsd_input_active branch
-    if S.scrub_input_active:
-        bar = f"  Jump to iteration: {S.scrub_input_buf}\u2588   (negative = from end)   Enter confirm   Esc cancel"
-    elif S.rmsd_input_active:
+    if state.scrub_input_active:
+        bar = f"  Jump to iteration: {state.scrub_input_buf}\u2588   (negative = from end)   Enter confirm   Esc cancel"
+    elif state.rmsd_input_active:
         _hints     = "   Enter confirm   Esc cancel"
         _prefix    = "  Atom selection: "
-        _input_str = S.rmsd_input_buf + "\u2588"
-        _err_str   = f"  ✗ {S.rmsd_sel_error}" if S.rmsd_sel_error else ""
+        _input_str = state.rmsd_input_buf + "\u2588"
+        _err_str   = f"  ✗ {state.rmsd_sel_error}" if state.rmsd_sel_error else ""
         _lhs       = _prefix + _input_str
-        _mid       = ("  e.g. 0-64,67,200-300" if not S.rmsd_sel_error else "")
+        _mid       = ("  e.g. 0-64,67,200-300" if not state.rmsd_sel_error else "")
         _rhs       = _mid + _err_str + _hints
         gap        = max(1, _term_cols - 1 - len(_lhs) - len(_rhs))
         bar        = _lhs + " " * gap + _rhs
     else:
         _z_label = "z Live" if _scrubbing else "z Freeze"
         if m.needs_atoms:
-            sel_hint = f" ({S.solute_sel_str})" if S.solute_sel_str else ""
+            sel_hint = f" ({state.solute_sel_str})" if state.solute_sel_str else ""
             bar = f"  q Quit   s/S Sparkline   ? Explain   a Atoms{sel_hint}   k Re-cluster   w/e ±1   W/E ±5%   j Jump   {_z_label}"
         else:
             bar = f"  q Quit   s/S Sparkline   ? Explain   k Re-cluster   w/e ±1   W/E ±5%   j Jump   {_z_label}"
@@ -3118,7 +3171,7 @@ def _render(stdscr: curses.window, S: types.SimpleNamespace, gradient: list[int]
         stdscr.addstr(bar, curses.A_REVERSE)
     except curses.error:
         pass  # terminal too narrow to draw the full bar; truncation is acceptable
-    if S.rmsd_input_active and S.rmsd_sel_error:
+    if state.rmsd_input_active and state.rmsd_sel_error:
         _err_attr = curses.color_pair(_CP_RED) | curses.A_BOLD | curses.A_REVERSE
         try:
             # Redraw the input text in red+bold
@@ -3208,12 +3261,12 @@ def _main(
     if curses.COLORS >= 256:
         _init_raster_pairs()
 
-    S      = _init_state(reader, n_iterations_arg, init_atom_sel, interval, storage)
+    state      = _init_state(reader, n_iterations_arg, init_atom_sel, interval, storage)
     try:
-        S.topology_molecules = reader.parse_topology()
+        state.topology_molecules = reader.parse_topology()
     except Exception:
         _LOG.warning("failed to parse system topology", exc_info=True)
-        S.topology_molecules = []
+        state.topology_molecules = []
     runner = TaskRunner()
 
     last_poll    = -1e9   # force immediate first poll
@@ -3231,20 +3284,20 @@ def _main(
             if key == curses.KEY_RESIZE:
                 needs_redraw = True
             else:
-                changed, should_quit = _handle_key(key, S)
+                changed, should_quit = _handle_key(key, state)
                 if should_quit:
                     return
                 if changed:
                     needs_redraw = True
 
         # ── Scrub data fetch (when pinned to a non-live iteration) ───────────
-        if S.scrub_dirty and S.scrub_iter is not None:
+        if state.scrub_dirty and state.scrub_iter is not None:
             try:
-                _fetch_scrub_data(reader, S)
+                _fetch_scrub_data(reader, state)
             except (OSError, IndexError, RuntimeError):
-                _LOG.warning("failed to fetch scrub data at iter %d; un-pinning", S.scrub_iter, exc_info=True)
-                S.scrub_iter = None
-            S.scrub_dirty = False
+                _LOG.warning("failed to fetch scrub data at iter %d; un-pinning", state.scrub_iter, exc_info=True)
+                state.scrub_iter = None
+            state.scrub_dirty = False
             needs_redraw  = True
 
         # ── Terminal resize (KEY_RESIZE unreliable under nodelay on Linux) ─
@@ -3261,14 +3314,14 @@ def _main(
         # ── Render first — paints "Waiting…" immediately on startup so the
         #    screen is never black while a slow poll or bulk read blocks below ─
         if needs_redraw:
-            _render(stdscr, S, gradient)
+            _render(stdscr, state, gradient)
             needs_redraw = False
 
         # ── Data poll (at the user-configured interval) ────────────────────
         if loop_start - last_poll >= interval:
             try:
                 reader.refresh()
-                if _poll(reader, S, stdscr):
+                if _poll(reader, state, stdscr):
                     needs_redraw = True
             except OSError:
                 pass  # transient file error during refresh/poll; retry next interval
@@ -3276,30 +3329,30 @@ def _main(
 
         # ── Submit incremental tasks (idempotent: check flags before adding) ─
         if (
-            not S.history_computing
-            and not S.waiting
-            and S.last_mixed_iter < S.display_iter
+            not state.history_computing
+            and not state.waiting
+            and state.last_mixed_iter < state.display_iter
         ):
-            S.history_computing = True
-            runner.submit(_history_scan_gen(reader, S))
+            state.history_computing = True
+            runner.submit(_history_scan_gen(reader, state))
 
-        if not S.state0_scanning and not S.waiting and S.state0_scan_iter <= S.display_iter:
-            S.state0_scanning = True
-            runner.submit(_state0_scan_gen(reader, S))
+        if not state.state0_scanning and not state.waiting and state.state0_scan_iter <= state.display_iter:
+            state.state0_scanning = True
+            runner.submit(_state0_scan_gen(reader, state))
 
         if (
-            not S.rmsd_computing
-            and not S.waiting
-            and S.solute_atom_sel is not None
-            and S.pos_interval > 0
-            and S.pos_scan_iter <= S.display_iter
+            not state.rmsd_computing
+            and not state.waiting
+            and state.solute_atom_sel is not None
+            and state.pos_interval > 0
+            and state.pos_scan_iter <= state.display_iter
         ):
-            S.rmsd_computing = True
-            runner.submit(_rmsd_gen(reader, S))
+            state.rmsd_computing = True
+            runner.submit(_rmsd_gen(reader, state))
 
         for _m in _SPARK_MODES:
             if _m.poll:
-                _m.poll(S, runner)
+                _m.poll(state, runner)
 
         # ── Run tasks for the rest of the 50 ms budget ─────────────────────
         # round-robin across tasks; each next() = one atomic work unit.
