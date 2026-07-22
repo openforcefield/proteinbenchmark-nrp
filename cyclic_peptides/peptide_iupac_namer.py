@@ -25,6 +25,7 @@
 # residue's type comes from which template tiles its atoms, not from
 # `residue.name`); nothing assumes the input atom order.
 
+import logging
 from dataclasses import dataclass
 from typing import Never, Protocol, Self, TypeAlias, TypedDict, TypeVar
 
@@ -34,6 +35,8 @@ import numpy
 from mdtraj.core import element as _mdtraj_element
 from mdtraj.core.topology import Atom as _Atom
 from networkx.algorithms import isomorphism as _isomorphism
+
+_log = logging.getLogger(__name__)
 
 
 class _AtomAttributes(TypedDict):
@@ -95,6 +98,50 @@ def _dihedral(
     cd_y = numpy.sum(y_hat * cd_proj, axis=-1)
     # Angle from ba_proj to cd_proj in old basis is angle from x axis to cd in new basis
     return numpy.degrees(numpy.arctan2(cd_y, cd_x))
+
+
+def _warn_on_degenerate_geometry(root_angles: numpy.ndarray, rule: object) -> None:
+    """Log a warning when a rule's branch-root dihedrals make its numbering ill-defined.
+
+    ``root_angles`` is an ``(n_frames, n_roots)`` array of signed dihedral angles
+    (degrees) for the branch roots a rule numbers by their angle about the B->C axis.
+    The rule always returns a valid permutation; this reports only the two cases where
+    that permutation is not geometrically meaningful, once each with a count of
+    affected frames. It changes no behaviour -- it purely observes:
+
+    * NaN -- the geometric frame has collapsed: a reference atom is collinear with the
+      B->C axis, two reference atoms coincide, or an input coordinate was already NaN.
+    * two roots with an *exactly* equal angle -- the branches are coincident about the
+      axis, so which is numbered first is a genuine coin-flip. This is exact equality,
+      not a tolerance: distinct atoms give distinct floating-point dihedrals, so a real,
+      working topology never trips it; only literally superimposed atoms do. A merely
+      close (but unequal) pair still yields a deterministic, technically-correct
+      numbering and is deliberately not reported.
+    """
+    if not _log.isEnabledFor(logging.WARNING):
+        return
+    n_frames, n_roots = root_angles.shape
+    nan_frames = numpy.isnan(root_angles).any(axis=1)
+    if nan_frames.any():
+        _log.warning(
+            "%r: dihedral is NaN in %d/%d frames; the numbering of those atoms is "
+            "arbitrary there",
+            rule,
+            int(nan_frames.sum()),
+            n_frames,
+        )
+    off_diagonal = ~numpy.eye(n_roots, dtype=bool)
+    coincident = (
+        (root_angles[:, :, None] == root_angles[:, None, :]) & off_diagonal
+    ).any(axis=(1, 2))
+    if coincident.any():
+        _log.warning(
+            "%r: two branch roots have an identical angle in %d/%d frames "
+            "(superimposed atoms); the numbering of those atoms is arbitrary there",
+            rule,
+            int(coincident.sum()),
+            n_frames,
+        )
 
 
 # --- IUPAC numbering rules ----------------------------------------------------
@@ -185,9 +232,13 @@ class _Methylene:
         # Unpack coordinates of each atom
         heavy, parent, center = reference_coords.transpose(1, 0, 2)
         h2c, h3c = managed_coords.transpose(1, 0, 2)
-        # Compute angles from the heavy branch to each hydrogen in range (0, 360)
-        clockwise_2 = numpy.mod(_dihedral(heavy, parent, center, h2c), 360.0)
-        clockwise_3 = numpy.mod(_dihedral(heavy, parent, center, h3c), 360.0)
+        # Compute angles from the heavy branch to each hydrogen
+        theta_2 = _dihedral(heavy, parent, center, h2c)
+        theta_3 = _dihedral(heavy, parent, center, h3c)
+        _warn_on_degenerate_geometry(numpy.stack([theta_2, theta_3], axis=1), self)
+        # Number clockwise from the heavy branch, in range [0, 360)
+        clockwise_2 = numpy.mod(theta_2, 360.0)
+        clockwise_3 = numpy.mod(theta_3, 360.0)
         # Reindex based on where each angle is greater
         return numpy.where((clockwise_3 < clockwise_2)[:, None], (1, 0), (0, 1))
 
@@ -251,8 +302,11 @@ class _TetraPair:
         low, parent, center = reference_coords.transpose(1, 0, 2)
         branch_1, branch_2 = managed_coords[:, 0], managed_coords[:, n_branch]
         # Compute the angle between F and each branch seen from B->C
-        clockwise_1 = numpy.mod(_dihedral(low, parent, center, branch_1), 360.0)
-        clockwise_2 = numpy.mod(_dihedral(low, parent, center, branch_2), 360.0)
+        theta_1 = _dihedral(low, parent, center, branch_1)
+        theta_2 = _dihedral(low, parent, center, branch_2)
+        _warn_on_degenerate_geometry(numpy.stack([theta_1, theta_2], axis=1), self)
+        clockwise_1 = numpy.mod(theta_1, 360.0)
+        clockwise_2 = numpy.mod(theta_2, 360.0)
         # Reorder indices into managed_coords
         indices = numpy.arange(managed_coords.shape[1])
         return numpy.where(
@@ -322,6 +376,7 @@ class _Methyl:
             ],
             axis=1,
         )
+        _warn_on_degenerate_geometry(theta, self)
         # Index all frames so we can broadcast our selection of H1 across them in indexing
         rows = numpy.arange(theta.shape[0])
         # Choose H1 by sorting first the absolute values of the angles `numpy.abs(theta)`
@@ -407,6 +462,7 @@ class _PlanarPair:
         # Compute the two dihedrals and their absolute values
         theta_1 = _dihedral(atom_a, atom_b, atom_c, root_1)
         theta_2 = _dihedral(atom_a, atom_b, atom_c, root_2)
+        _warn_on_degenerate_geometry(numpy.stack([theta_1, theta_2], axis=1), self)
         abs_1, abs_2 = numpy.abs(theta_1), numpy.abs(theta_2)
         # Order the indices for each frame according to the rule
         # Exchanging the two branches rotates the layout by one branch length
@@ -925,6 +981,35 @@ def _partition_residues(
     return [(resname, name_map_of[(resname, atoms)]) for resname, atoms in cover]
 
 
+def _log_reordering(
+    permutation: numpy.ndarray,
+    resname: str,
+    sequence_position: int,
+    rule: _Rule,
+    n_frames: int,
+) -> bool:
+    """Log the frames a rule reordered and report whether it reordered any.
+
+    ``permutation`` is the rule's ``(n_frames, n_managed)`` output. A frame counts as
+    reordered when its row is not the identity ``0 .. n_managed - 1``. Emits one DEBUG
+    record naming the residue, rule, and managed atoms when any frame was reordered,
+    and returns whether that happened so the caller can tally the effective rules.
+    """
+    reordered_frames = (permutation != numpy.arange(permutation.shape[1])).any(axis=1)
+    if not reordered_frames.any():
+        return False
+    _log.debug(
+        "%s %d (%s): reordered %s in %d/%d frames",
+        resname,
+        sequence_position,
+        type(rule).__name__,
+        ", ".join(rule.managed_names),
+        int(reordered_frames.sum()),
+        n_frames,
+    )
+    return True
+
+
 def canonicalize_iupac_names(
     traj: "mdtraj.Trajectory",
 ) -> "mdtraj.Trajectory":
@@ -951,6 +1036,11 @@ def canonicalize_iupac_names(
     mdtraj.Trajectory
         A new trajectory; ``traj`` is not modified.
     """
+    _log.info(
+        "Canonicalising IUPAC names: %d frames, %d atoms",
+        traj.n_frames,
+        traj.topology.n_atoms,
+    )
     graph = _bond_graph(traj.topology)
 
     # --- Partition atoms into residues by exact-cover template tiling ---------
@@ -1019,6 +1109,13 @@ def canonicalize_iupac_names(
             "the peptide bonds do not form a single chain or cycle",
         )
 
+    _log.info(
+        "Tiled a %s backbone of %d residues: %s",
+        "cyclic" if not chain_starts else "linear",
+        len(order),
+        "-".join(partition[res_idx][0] for res_idx in order),
+    )
+
     # --- Build the output topology (independent of coordinates) ---------------
     # Residues and atoms are added in canonical (residue, template) order, so the
     # i-th residue of `new_topology` is `order[i]` and each new atom's index is its
@@ -1068,7 +1165,8 @@ def canonicalize_iupac_names(
     # Reorder some atoms in some frames so that the IUPAC naming rules are upheld
     # Note that this abandons any notion of realistic dynamics as atoms appear
     # to be frozen in their relative stereochemistry
-    for res_idx in order:
+    reordering_rule_applications = 0
+    for sequence_position, res_idx in enumerate(order, start=1):
         resname, name_map = partition[res_idx]
         atom_map = atom_map_of_res_idx[res_idx]
         for rule in _rules_leaves_first(_TEMPLATES[resname].rules):
@@ -1083,6 +1181,9 @@ def canonicalize_iupac_names(
             )
             # Allow the rule to choose new indices for the managed coords
             new_managed_coords_order = rule.reindex(reference_coords, managed_coords)
+            reordering_rule_applications += _log_reordering(
+                new_managed_coords_order, resname, sequence_position, rule, n_frames
+            )
             # Modify `perm` given the reindexing
             managed_atom_idcs: list[int] = [
                 atom_map[name].index for name in rule.managed_names
@@ -1092,6 +1193,11 @@ def canonicalize_iupac_names(
                 new_managed_coords_order,
                 axis=1,
             )
+    _log.info(
+        "Canonicalisation complete: %d rule application(s) reordered atoms in at "
+        "least one frame",
+        reordering_rule_applications,
+    )
     # Use `perm` to reorder `xyz` in one shot
     new_xyz = numpy.take_along_axis(xyz, perm[:, :, None], axis=1)
 

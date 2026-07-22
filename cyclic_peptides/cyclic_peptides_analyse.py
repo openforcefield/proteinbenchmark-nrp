@@ -1,3 +1,5 @@
+import logging
+import sys
 import zlib
 from collections.abc import Iterable
 from pathlib import Path
@@ -12,6 +14,8 @@ import yaml
 from cyclic_peptides_pydantic import BenchmarkConfig
 from openmmtools.utils import quantity_from_string
 from peptide_iupac_namer import canonicalize_iupac_names
+
+_log = logging.getLogger(__name__)
 
 
 class ThermodynamicStateYamlLoader(yaml.Loader):
@@ -53,7 +57,17 @@ class ThermodynamicStateYamlLoader(yaml.Loader):
 def main(
     config_json: Path,
     results: Path,
+    debug: bool,
+    overwrite_files: bool,
+    log_stdout: bool,
 ):
+    logging.basicConfig(
+        level=logging.DEBUG if debug else logging.INFO,
+        datefmt="%Y-%m-%d %H:%M:%S",
+        format="%(asctime)s.%(msecs)03d [%(levelname)8s] %(message)s (%(filename)s:%(lineno)s via %(name)s)",
+        stream=sys.stdout if log_stdout else sys.stderr,
+    )
+
     config = BenchmarkConfig.from_json_path(config_json)
     for target in config.targets:
         target_path = results / target.sequence
@@ -61,14 +75,14 @@ def main(
             storage_path = replica_dir / f"{target.sequence}-storage.nc"
             checkpoint_path = replica_dir / f"{target.sequence}-checkpoint.nc"
             topology_path = config_json.parent / f"{target.name}-rung0.pdb"
-            process_storage(storage_path, checkpoint_path, topology_path, target.smiles)
+            storage_to_dcd_pdb(storage_path, checkpoint_path, topology_path, overwrite_files)
 
 
-def process_storage(
+def storage_to_dcd_pdb(
     storage_path: Path,
     checkpoint_path: Path,
     topology_path: Path,
-    peptide_smiles: str,
+    overwrite_files: bool,
 ):
     assert storage_path.exists()
     assert checkpoint_path.exists()
@@ -79,12 +93,16 @@ def process_storage(
     target_iters = options["number_of_iterations"]
     completed_iters = nc.variables["last_iteration"][0]
 
-    print(f"{storage_path}: {completed_iters}/{target_iters}")
+    _log.info(
+        "%s: %s/%s iterations completed", storage_path, completed_iters, target_iters
+    )
     if target_iters > completed_iters:
-        print(f"    WARNING: {storage_path} has not completed. Continue with:")
         _, _, i_repl = storage_path.parent.name.partition("replica-")
-        print(
-            f"        kubectl apply -f {unwrap(storage_path.parent.glob(f'*-{i_repl}.yaml'))}",
+        resume_manifest = unwrap(storage_path.parent.glob(f"*-{i_repl}.yaml"))
+        _log.warning(
+            "%s has not completed; resume with: kubectl apply -f %s",
+            storage_path,
+            resume_manifest,
         )
 
     # Load the system and get a list of bonds
@@ -125,10 +143,10 @@ def process_storage(
 
     dcd_path = storage_path.with_suffix(".aligned.reindexed.dcd")
     pdb_path = storage_path.with_suffix(".aligned.reindexed.pdb")
-    traj.save_dcd(dcd_path)
-    print(f"Saved {dcd_path} with {traj.n_frames} frames, {traj.n_atoms} atoms")
-    traj[0].save_pdb(pdb_path)
-    print(f"Saved {pdb_path} with {traj.n_atoms} atoms")
+    traj.save_dcd(dcd_path, force_overwrite=overwrite_files)
+    _log.info("Saved %s with %s frames, %s atoms", dcd_path, traj.n_frames, traj.n_atoms)
+    traj[0].save_pdb(pdb_path, force_overwrite=overwrite_files)
+    _log.info("Saved %s with %s atoms", pdb_path, traj.n_atoms)
 
 
 def system_from_openmmtools_storage(nc: netCDF4.Dataset) -> openmm.System:
