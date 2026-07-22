@@ -1,0 +1,216 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cyclic-peptides-benchmark-v1.0.0.schema.json",
+  "title": "Cyclic Peptides Benchmark Configuration v1.0.0",
+  "description": "Configuration for cyclic peptide REST2 simulations using OpenFF force fields",
+  "type": "object",
+  "required": ["targets", "configuration"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "JSON Schema URI for editor autocomplete"
+    },
+    "targets": {
+      "type": "array",
+      "minItems": 1,
+      "description": "List of cyclic peptide targets to simulate",
+      "items": {
+        "type": "object",
+        "required": ["smiles", "sequence"],
+        "additionalProperties": false,
+        "properties": {
+          "smiles": {
+            "type": "string",
+            "description": "SMILES string defining the cyclic peptide topology"
+          },
+          "sequence": {
+            "type": "string",
+            "description": "One-letter amino acid sequence, used in output file names"
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable label for this target. Defaults to sequence if omitted."
+          }
+        }
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "required": [
+        "force_field_files",
+        "solvation",
+        "integration",
+        "lengths",
+        "ensemble"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "force_field_files": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" },
+          "description": "Ordered list of OpenFF SMIRNOFF force field files passed to ForceField(). Example: [\"openff_no_water-3.0.0-alpha0.offxml\", \"opc3.offxml\"]"
+        },
+        "solvation": {
+          "type": "object",
+          "description": "Arguments to solvate_topology() from openff.interchange.components._packmol",
+          "required": ["solvent_padding_nm", "nacl_molarity", "box_shape"],
+          "additionalProperties": false,
+          "properties": {
+            "solvent_padding_nm": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Padding around the solute in nanometers"
+            },
+            "nacl_molarity": {
+              "type": "number",
+              "minimum": 0,
+              "description": "NaCl concentration in mol/L (molar)"
+            },
+            "box_shape": {
+              "enum": [
+                "RHOMBIC_DODECAHEDRON",
+                "CUBE",
+                "RHOMBIC_DODECAHEDRON_XYHEX"
+              ],
+              "description": "Shape of the periodic box"
+            }
+          }
+        },
+        "integration": {
+          "type": "object",
+          "description": "Properties of the integrator, barostat, and thermostat",
+          "required": [
+            "temperature",
+            "pressure",
+            "langevin_friction",
+            "barostat_frequency",
+            "timestep_fs"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "temperature": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Simulation temperature in kelvin"
+            },
+            "pressure": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Simulation pressure in atmospheres"
+            },
+            "langevin_friction": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Langevin friction coefficient in inverse picoseconds"
+            },
+            "barostat_frequency": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Number of steps between Monte Carlo barostat attempts"
+            },
+            "timestep_fs": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Integration timestep in femtoseconds. Recommended: 4.0 fs when hydrogen_mass is set, 2.0 fs otherwise."
+            },
+            "hydrogen_mass": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "default": 1.00784,
+              "description": "Hydrogen mass for repartitioning in daltons. Recommend: 3.0 to enable HMR, unset otherwise."
+            }
+          }
+        },
+        "lengths": {
+          "type": "object",
+          "description": "Time-length OpenMMSimulation constructor arguments and equilibration length",
+          "required": [
+            "equilibration_length_ns",
+            "traj_length_ns",
+            "frame_length_ns",
+            "checkpoint_length_ns"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "equilibration_length_ns": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Equilibration run length in nanoseconds, passed to sampler.equilibrate()"
+            },
+            "traj_length_ns": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Production trajectory length in nanoseconds"
+            },
+            "frame_length_ns": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Interval between trajectory frames in nanoseconds"
+            },
+            "checkpoint_length_ns": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Interval between checkpoint saves in nanoseconds"
+            }
+          }
+        },
+        "ensemble": {
+          "type": "object",
+          "description": "Arguments to OpenMMHrexEnsemble.construct_rest2()",
+          "required": [
+            "n_replicas",
+            "max_effective_temperature",
+            "steps_between_exchange_attempts"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "n_replicas": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Number of REST2 replicas"
+            },
+            "max_effective_temperature": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Maximum effective temperature for the REST2 ladder in kelvin"
+            },
+            "steps_between_exchange_attempts": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Number of MD steps between replica exchange attempts. Must evenly divide the steps derived from traj_length, frame_length, and checkpoint_length."
+            }
+          }
+        },
+        "file_names": {
+          "type": "object",
+          "description": "Python f-string templates for output file paths. Available variables: {smiles}, {sequence}, {name}, {n_replicas}, {timestep_fs}.",
+          "additionalProperties": false,
+          "properties": {
+            "storage_file": {
+              "type": "string",
+              "default": "{name}-storage.nc",
+              "description": "Path for the NetCDF trajectory/state reporter storage file"
+            },
+            "checkpoint_file": {
+              "type": "string",
+              "default": "{name}-checkpoint.nc",
+              "description": "Path for the simulation checkpoint file"
+            },
+            "save_state_prefix": {
+              "type": "string",
+              "default": "{name}-state_",
+              "description": "Prefix for full state save files"
+            },
+            "visualization_file": {
+              "type": "string",
+              "default": "peptide_{name}.svg",
+              "description": "Path for the peptide structure visualization SVG"
+            }
+          }
+        }
+      }
+    }
+  }
+}

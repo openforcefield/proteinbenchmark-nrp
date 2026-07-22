@@ -17,11 +17,11 @@ spec:
                   - key: nvidia.com/cuda.runtime.major
                     operator: In
                     values:
-                      - "12"
+                      - "13"
                   - key: nvidia.com/cuda.runtime.minor
                     operator: In
                     values:
-                      - "4"
+                      - "2"
       initContainers:
         - name: init-git
           image: alpine/git
@@ -67,7 +67,7 @@ spec:
               IFS=$'\n'
               for FILE in ${PROTBENCH_REQUIRED_FILES}; do
                 echo "cloning to /results/$FILE"
-                rclone copyto --progress nrp-internal:proteinbenchmark-jm-bucket/results/$FILE /results/$FILE
+                rclone copyto --progress nrp-internal:cyclicpeptides-am-bucket/results/$FILE /results/$FILE
               done
               unset IFS
               echo "done cloning"
@@ -118,16 +118,16 @@ spec:
             - /bin/sh
             - -c
             - |
-              micromamba run -n base pip install git+https://github.com/openforcefield/proteinbenchmark.git@nagl
-              micromamba run -n base python /opt/repo/$(PROTBENCH_SCRIPT_PATH) -o/results
-              rclone copy --update /results nrp-internal:proteinbenchmark-jm-bucket/results
+              micromamba run -n base pip install git+https://github.com/openforcefield/proteinbenchmark.git@cyclic-peptides
+              micromamba run -n base python /opt/repo/$(PROTBENCH_SCRIPT_PATH) $(PROTBENCH_SCRIPT_ARG)
+              rclone copy --update /results nrp-internal:cyclicpeptides-am-bucket/results
           lifecycle:
             preStop:
               exec:
                 command:
                   - /bin/sh
                   - -c
-                  - rclone copy --update /results nrp-internal:proteinbenchmark-jm-bucket/results 2>&1 > /proc/1/fd/1
+                  - rclone copy --update /results nrp-internal:cyclicpeptides-am-bucket/results 2>&1 > /proc/1/fd/1
       volumes:
         - name: rclone-config
           secret:

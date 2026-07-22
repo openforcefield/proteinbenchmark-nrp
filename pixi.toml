@@ -1,0 +1,64 @@
+[workspace]
+channels = ["conda-forge", "openeye"]
+name = "proteinbenchmark-nrp"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = ">=3.11"
+ambertools = "*"
+openeye-toolkits = "*"
+openff-forcefields = "*"
+openff-toolkit = ">=0.17.0"
+openff-units = "*"
+openmm = ">=8.5.0"
+openmmforcefields = ">=0.12.0"
+openmmtools = ">=0.26.0"
+cyclopts = "*"
+mdanalysis = ">=2.10.0"
+mdtraj = ">=1.11.1"
+
+[pypi-dependencies]
+proteinbenchmark = { git = "https://www.github.com/openforcefield/proteinbenchmark", rev = "main" }
+
+[feature.nagl.dependencies]
+openff-nagl = ">=0.5.4"
+pytorch = ">=2.6.0"
+
+[feature.analysis.dependencies]
+loos = "*"
+pandas = "*"
+pymol-open-source = "*"
+seaborn = "*"
+pymbar = ">=4.2.0"
+
+[feature.espaloma.dependencies]
+espaloma = ">=0.3.2"
+
+[feature.system-prep.dependencies]
+python = "<3.12"
+[feature.system-prep.pypi-dependencies]
+# pmx = { git = "https://github.com/deGrootLab/pmx", branch = "develop" }
+pdb2pqr = { git = "https://github.com/Electrostatics/pdb2pqr", branch = "DEPRECATED_master" }
+
+[feature.test.dependencies]
+pytest = "*"
+pytest-cov = "*"
+codecov = "*"
+
+[feature.ruamel.dependencies]
+ruamel = "*"
+
+[feature.rocm.dependencies]
+pip = "*"
+[feature.rocm.activation]
+scripts = ["pixi-activation-scripts/rocm.sh"]
+
+[environments]
+default = { features = ["analysis", "system-prep", "ruamel", "nagl"], solve-group = "default" }
+rocm = { features = ["ruamel", "nagl", "rocm"], solve-group = "default" }
+espaloma = { features = ["analysis", "espaloma", "system-prep"], solve-group = "espaloma" }
+simulation = { features = [], solve-group = "default" }
+test = { features = ["test"], solve-group = "default", no-default-feature = true }

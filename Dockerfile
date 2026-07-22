@@ -1,6 +1,6 @@
-FROM mambaorg/micromamba:2-cuda12.4.1-ubuntu22.04
+FROM mambaorg/micromamba:2.5.0-cuda13.2.0-ubuntu24.04
 
-ARG BRANCH=nagl
+ARG BRANCH=cyclic-peptides
 ARG REPO=openforcefield/proteinbenchmark
 ARG ENV_PATH=devtools/conda-envs/proteinbenchmark-simulation.yaml
 # ARG ENV_PATH=devtools/conda-envs/proteinbenchmark.yaml
@@ -13,7 +13,7 @@ ADD --chown=$MAMBA_USER:$MAMBA_USER \
     https://github.com/$REPO/raw/refs/heads/$BRANCH/$ENV_PATH \
     /tmp/env.yaml
 
-RUN micromamba install click openff-nagl 'cuda-version==12.4' 'python<3.12' -y -n base -f /tmp/env.yaml &&\
+RUN micromamba install cyclopts 'cuda-version==13.2' 'python==3.12' -y -n base -f /tmp/env.yaml &&\
     micromamba clean --all --yes &&\
     micromamba list
 
