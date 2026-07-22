@@ -7,7 +7,7 @@ version = "0.1.0"
 [tasks]
 
 [dependencies]
-python = "*"
+python = ">=3.11"
 ambertools = "*"
 openeye-toolkits = "*"
 openff-forcefields = "*"
@@ -17,9 +17,11 @@ openmm = ">=8.5.0"
 openmmforcefields = ">=0.12.0"
 openmmtools = ">=0.26.0"
 cyclopts = "*"
+mdanalysis = ">=2.10.0"
+mdtraj = ">=1.11.1"
 
 [pypi-dependencies]
-proteinbenchmark = { git = "https://www.github.com/openforcefield/proteinbenchmark", rev = "cyclic-peptides" }
+proteinbenchmark = { git = "https://www.github.com/openforcefield/proteinbenchmark", rev = "main" }
 
 [feature.nagl.dependencies]
 openff-nagl = ">=0.5.4"
